@@ -11,6 +11,7 @@ import pino from 'pino';
 import express from 'express';
 import dotenv from 'dotenv';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import sharp from 'sharp';
@@ -471,23 +472,46 @@ async function startExpressServer() {
     });
   });
 
+  app.get(['/health', '/healthz'], (req, res) => {
+    res.status(200).json({
+      ok: true,
+      service: 'spiver-bot',
+      status: global.botStatus || 'Offline',
+      sessionDir: resolveSessionDir(),
+      fallbackLocal: sessionStorageFallbackUsed,
+      uptimeSeconds: Math.floor(process.uptime()),
+    });
+  });
+
   app.get('/qr', (req, res) => {
     res.redirect('/pairing');
   });
 
-  app.use(express.static(WEB_DIR));
+  if (fs.existsSync(WEB_DIR)) {
+    app.use(express.static(WEB_DIR));
+  }
 
-  app.get('/pairing', (req, res) => {
-    res.sendFile(path.join(WEB_DIR, 'index.html'));
-  });
+  const sendWebDashboard = (req, res) => {
+    const indexHtml = path.join(WEB_DIR, 'index.html');
+    if (fs.existsSync(indexHtml)) {
+      return res.sendFile(indexHtml);
+    }
+    return res.status(200).send('SPIVER BOT active. Healthcheck: /health');
+  };
 
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(WEB_DIR, 'index.html'));
-  });
+  app.get('/pairing', sendWebDashboard);
+  app.get('*', sendWebDashboard);
 
   const port = Number(process.env.PORT) || 3000;
-  app.listen(port, '0.0.0.0', () => {
-    console.log(`[WEB] SPIVER BOT dashboard berjalan di http://localhost:${port}`);
+  return new Promise((resolve) => {
+    const server = app.listen(port, '0.0.0.0', () => {
+      console.log(`[WEB] SPIVER BOT dashboard & healthcheck berjalan di http://0.0.0.0:${port} (/health)`);
+      resolve(server);
+    });
+    server.on('error', (err) => {
+      console.error(`[WEB ERROR] Gagal listen di port ${port}:`, err?.message || err);
+      resolve(null);
+    });
   });
 }
 
@@ -505,12 +529,81 @@ let pairingMetaCache = {
   initialCodeIssued: false,
 };
 
-function resolveSessionDir() {
+let resolvedSessionDirCache = null;
+let sessionStorageFallbackUsed = false;
+
+function isWritableDir(dirPath) {
+  try {
+    fs.mkdirSync(dirPath, { recursive: true });
+    const probeFile = path.join(dirPath, `.write_test_${process.pid}_${Date.now()}`);
+    fs.writeFileSync(probeFile, 'ok');
+    fs.unlinkSync(probeFile);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function initSessionDir() {
+  if (resolvedSessionDirCache) return resolvedSessionDirCache;
+
   const customDir = (process.env.SESSION_DIR || '').trim();
-  if (customDir) return path.resolve(customDir);
   const railwayVolume = (process.env.RAILWAY_VOLUME_MOUNT_PATH || '').trim();
-  if (railwayVolume) return path.join(path.resolve(railwayVolume), 'session');
-  return path.join(ROOT_DIR, 'session');
+  const localFallback = path.join(ROOT_DIR, 'session');
+
+  if (customDir) {
+    const resolvedCustom = path.resolve(customDir);
+    const usesDataMount = resolvedCustom === '/data' || resolvedCustom.startsWith('/data/');
+    const dataMountReady = Boolean(railwayVolume) || fs.existsSync('/data');
+
+    if (usesDataMount && !dataMountReady) {
+      console.warn(
+        `⚠️ [SESSION WARNING] SESSION_DIR=${resolvedCustom}, tetapi Volume /data belum ter-mount (folder /data & RAILWAY_VOLUME_MOUNT_PATH tidak ditemukan).`
+      );
+      console.warn(
+        `⚠️ Fallback ke folder lokal: ${localFallback} (pasang Volume /data di Railway agar session permanen saat redeploy).`
+      );
+      sessionStorageFallbackUsed = true;
+    } else if (isWritableDir(resolvedCustom)) {
+      resolvedSessionDirCache = resolvedCustom;
+      console.log(`📁 Session directory aktif: ${resolvedSessionDirCache}`);
+      return resolvedSessionDirCache;
+    } else {
+      console.warn(
+        `⚠️ [SESSION WARNING] Folder SESSION_DIR (${resolvedCustom}) tidak bisa dibuat/ditulis (ENOENT / Permission denied).`
+      );
+      console.warn(`⚠️ Fallback ke folder lokal: ${localFallback}`);
+      sessionStorageFallbackUsed = true;
+    }
+  } else if (railwayVolume) {
+    const volumeSessionDir = path.join(path.resolve(railwayVolume), 'session');
+    if (isWritableDir(volumeSessionDir)) {
+      resolvedSessionDirCache = volumeSessionDir;
+      console.log(`📁 Session directory aktif (Railway Volume): ${resolvedSessionDirCache}`);
+      return resolvedSessionDirCache;
+    }
+    console.warn(`⚠️ [SESSION WARNING] Railway Volume (${volumeSessionDir}) tidak bisa ditulis. Fallback ke ${localFallback}`);
+    sessionStorageFallbackUsed = true;
+  }
+
+  if (isWritableDir(localFallback)) {
+    resolvedSessionDirCache = localFallback;
+    if (!customDir && !railwayVolume) {
+      console.log(`📁 Session directory aktif: ${resolvedSessionDirCache}`);
+    }
+  } else {
+    const tmpFallback = path.join(os.tmpdir(), 'spiver-bot-session');
+    fs.mkdirSync(tmpFallback, { recursive: true });
+    resolvedSessionDirCache = tmpFallback;
+    sessionStorageFallbackUsed = true;
+    console.warn(`⚠️ [SESSION WARNING] Folder lokal tidak bisa ditulis. Fallback ke ${tmpFallback}`);
+  }
+
+  return resolvedSessionDirCache;
+}
+
+function resolveSessionDir() {
+  return initSessionDir();
 }
 
 function getPairingMetaPath(sessionDir) {
@@ -893,7 +986,11 @@ async function startBot(options = {}) {
     console.log(`📂 Status Session: ${isSessionValid ? `ADA (${sessionSource})` : 'TIDAK ADA (butuh pairing awal)'} | Path: ${sessionDir}`);
     console.log(`🕒 Terakhir Pairing: ${lastPairingLabel} | Retry: ${pairingMetaCache.retryCount}/${MAX_RATE_LIMIT_RETRIES} | Retry Berikutnya: ${nextRetryLabel}`);
 
-    if (!isSessionValid) {
+    const phoneNumber = getActivePhoneNumber();
+
+    if (isSessionValid) {
+      console.log(`✅ Session tersimpan ditemukan (${sessionSource}). Menghubungkan bot langsung tanpa pairing ulang...`);
+    } else {
       if (pairingMetaCache.rateLimitStopped) {
         global.botStatus = 'Offline';
         global.pairingError =
@@ -927,9 +1024,24 @@ async function startBot(options = {}) {
         global.pairingError =
           'Pairing code sudah pernah diminta 1x sebelumnya. Klik "Buat Ulang Kode" jika ingin meminta kode baru.';
         console.log('ℹ️ Pairing code sudah pernah diminta 1x saat setup. Bot tidak meminta kode baru otomatis saat restart agar tidak terkena rate-limit.');
+        console.log('📌 Buka halaman /pairing di web dashboard lalu klik "Buat Ulang Kode" jika ingin pairing ulang.');
         startSupabaseSessionWatcher(sessionDir, runId);
         return;
       }
+
+      if (!phoneNumber || phoneNumber.length < 10) {
+        global.botStatus = 'Offline';
+        global.pairingError = 'PHONE_NUMBER belum diisi atau tidak valid (contoh: 6285743794723).';
+        console.log('⚠️ Session belum ada dan PHONE_NUMBER belum diisi. Menunggu konfigurasi tanpa restart/loop.');
+        console.log('📌 Isi PHONE_NUMBER di Railway Variables atau masukkan nomor di halaman /pairing.');
+        startSupabaseSessionWatcher(sessionDir, runId);
+        return;
+      }
+
+      console.log('📌 Instruksi Pairing (1 HP):');
+      console.log('   1. Buka WhatsApp > Titik 3 > Perangkat Tertaut > Tautkan Perangkat');
+      console.log('   2. Pilih "Tautkan dengan Nomor Telepon"');
+      console.log('   3. Masukkan kode 8 digit yang muncul di log ini atau di halaman /pairing');
     }
 
     if (runId !== currentBotRunId) return;
@@ -948,7 +1060,6 @@ async function startBot(options = {}) {
     if (runId !== currentBotRunId) return;
     console.log('🌐 Menggunakan versi WhatsApp Web:', version.join('.'));
 
-    const phoneNumber = getActivePhoneNumber();
     const inferredCountry = phoneNumber.startsWith('62') ? 'ID' : 'US';
 
     const sock = makeWASocket({
@@ -2704,12 +2815,25 @@ async function startBot(options = {}) {
       }
     }
   });
+  } catch (err) {
+    global.botStatus = 'Offline';
+    console.error('[startBot error]', err?.message || err);
   } finally {
     isStartingBot = false;
   }
 }
 
-startExpressServer();
-startBot().catch((err) => {
-  console.error('[Bot fatal error]', err);
+process.on('unhandledRejection', (reason) => {
+  console.error('[Unhandled Rejection]', reason?.message || reason);
 });
+
+process.on('uncaughtException', (err) => {
+  console.error('[Uncaught Exception]', err?.message || err);
+});
+
+(async () => {
+  await startExpressServer();
+  await startBot().catch((err) => {
+    console.error('[Bot startup error]', err?.message || err);
+  });
+})();
