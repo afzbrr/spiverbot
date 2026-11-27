@@ -100,15 +100,23 @@ git push -u origin main
 4. Klik **Deploy**.
 5. Setelah live, buka dashboard Vercel kamu dan tempel URL Railway bot kamu di kolom **URL Server Bot Railway** agar dashboard menampilkan status & kode pairing secara real-time.
 
-### 10. Deploy Bot ke Railway
+### 10. Deploy Bot ke Railway (Dengan Session Permanen)
 1. Buka [https://railway.app](https://railway.app) dan login dengan akun GitHub.
 2. Klik **New Project** > **Deploy from GitHub repo** > pilih `spiver-bot`.
-3. Masuk ke tab **Variables** di service Railway kamu dan tambahkan semua variabel dari `.env`:
-   - `PHONE_NUMBER`
-   - `OWNER_NUMBER`
+3. **Pasang Railway Volume (WAJIB agar session tidak hilang saat restart/redeploy)**:
+   - Buka service bot kamu di Railway > klik **Settings** / tekan `Ctrl+K` > pilih **Add Volume**.
+   - Isi **Mount Path**: `/data`.
+4. Masuk ke tab **Variables** di service Railway kamu dan tambahkan semua variabel berikut:
+   - `PHONE_NUMBER` (contoh: `6285743794723`)
+   - `OWNER_NUMBER` (contoh: `6285743794723`)
    - `GEMINI_API_KEY`
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
-   - `PORT=3000`
-4. Railway otomatis membaca `railway.json` dan menjalankan `node bot/index.js`.
-5. Buka **Deploy Logs** atau URL domain Railway (`/pairing`) untuk melihat kode pairing 8 digit dan tautkan ke WhatsApp kamu.
+   - `SESSION_DIR=/data/session` *(opsional jika Volume di-mount di `/data`, karena bot otomatis membaca `RAILWAY_VOLUME_MOUNT_PATH/session`)*
+   - `PORT=3000` *(atau biarkan port default dari Railway)*
+5. Railway otomatis membaca `railway.json` dan menjalankan `node bot/index.js`.
+6. Buka **Deploy Logs** atau URL domain Railway (`/pairing`) untuk melihat **kode pairing 8 digit** (diminta **1x saja** saat setup awal) lalu tautkan ke WhatsApp kamu.
+7. **Anti Rate-Limit (`429: rate-overlimit`)**:
+   - Session tersimpan permanen di Railway Volume (`/data/session`) **dan** di-backup otomatis ke tabel `settings` Supabase (`wa_auth_session`).
+   - Bot tidak akan meminta kode pairing berulang-ulang saat restart/redeploy.
+   - Jika server WhatsApp menolak dengan `429`, bot otomatis memakai **exponential backoff** (5 menit → 15 menit → 30 menit, maksimal 3x retry) lalu berhenti aman tanpa crash-loop sambil menunggu jeda 1–2 jam.

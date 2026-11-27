@@ -395,6 +395,8 @@ async function startExpressServer() {
       expiresAt && global.pairingCode && global.botStatus !== 'Online'
         ? Math.max(0, Math.floor((expiresAt - now) / 1000))
         : 0;
+    const sessionDir = resolveSessionDir();
+    const sessionExists = fs.existsSync(path.join(sessionDir, 'creds.json'));
     res.json({
       code: global.pairingCode || null,
       error: global.pairingError || null,
@@ -403,6 +405,14 @@ async function startExpressServer() {
       expiresAt,
       remainingSeconds,
       ttlMs: PAIRING_DURATION_MS,
+      sessionExists,
+      sessionPath: sessionDir,
+      lastPairingAt: pairingMetaCache.lastAttemptAt,
+      lastPairedAt: pairingMetaCache.lastPairedAt,
+      nextRetryAt: pairingMetaCache.nextRetryAt,
+      retryCount: pairingMetaCache.retryCount,
+      maxRetries: MAX_RATE_LIMIT_RETRIES,
+      rateLimitStopped: pairingMetaCache.rateLimitStopped,
     });
   });
 
@@ -438,7 +448,7 @@ async function startExpressServer() {
 
     await restartPairingSession();
 
-    for (let i = 0; i < 35; i++) {
+    for (let i = 0; i < 40; i++) {
       if (global.pairingCode || global.pairingError) break;
       await new Promise((r) => setTimeout(r, 300));
     }
@@ -454,6 +464,10 @@ async function startExpressServer() {
       expiresAt: global.pairingExpiresAt,
       remainingSeconds,
       ttlMs: PAIRING_DURATION_MS,
+      nextRetryAt: pairingMetaCache.nextRetryAt,
+      retryCount: pairingMetaCache.retryCount,
+      maxRetries: MAX_RATE_LIMIT_RETRIES,
+      rateLimitStopped: pairingMetaCache.rateLimitStopped,
     });
   });
 
@@ -478,7 +492,81 @@ async function startExpressServer() {
 }
 
 const SUPABASE_SESSION_KEY = 'wa_auth_session';
-const RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000; // 15 menit
+const SUPABASE_PAIRING_META_KEY = 'wa_pairing_meta';
+const RATE_LIMIT_BACKOFF_MINUTES = [5, 15, 30, 60];
+const MAX_RATE_LIMIT_RETRIES = 3;
+
+let pairingMetaCache = {
+  retryCount: 0,
+  lastAttemptAt: null,
+  lastPairedAt: null,
+  nextRetryAt: null,
+  rateLimitStopped: false,
+  initialCodeIssued: false,
+};
+
+function resolveSessionDir() {
+  const customDir = (process.env.SESSION_DIR || '').trim();
+  if (customDir) return path.resolve(customDir);
+  const railwayVolume = (process.env.RAILWAY_VOLUME_MOUNT_PATH || '').trim();
+  if (railwayVolume) return path.join(path.resolve(railwayVolume), 'session');
+  return path.join(ROOT_DIR, 'session');
+}
+
+function getPairingMetaPath(sessionDir) {
+  return path.join(sessionDir, '_pairing_meta.json');
+}
+
+async function loadPairingMeta(sessionDir) {
+  const metaPath = getPairingMetaPath(sessionDir);
+  try {
+    if (fs.existsSync(metaPath)) {
+      const raw = await fs.promises.readFile(metaPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      pairingMetaCache = { ...pairingMetaCache, ...parsed };
+      return pairingMetaCache;
+    }
+  } catch {}
+
+  if (isSupabaseConfigured) {
+    try {
+      const rawDb = await getSetting(SUPABASE_PAIRING_META_KEY, '');
+      if (rawDb && rawDb.startsWith('{')) {
+        const parsed = JSON.parse(rawDb);
+        pairingMetaCache = { ...pairingMetaCache, ...parsed };
+        return pairingMetaCache;
+      }
+    } catch {}
+  }
+
+  return pairingMetaCache;
+}
+
+async function savePairingMeta(sessionDir, partial) {
+  pairingMetaCache = { ...pairingMetaCache, ...partial };
+  const serialized = JSON.stringify(pairingMetaCache);
+  try {
+    await fs.promises.mkdir(sessionDir, { recursive: true });
+    await fs.promises.writeFile(getPairingMetaPath(sessionDir), serialized, 'utf-8');
+  } catch {}
+  if (isSupabaseConfigured) {
+    try {
+      await setSetting(SUPABASE_PAIRING_META_KEY, serialized);
+    } catch {}
+  }
+  return pairingMetaCache;
+}
+
+async function cleanAuthFilesOnly(sessionDir) {
+  try {
+    if (!fs.existsSync(sessionDir)) return;
+    const files = await fs.promises.readdir(sessionDir);
+    for (const file of files) {
+      if (file === '_pairing_meta.json') continue;
+      await fs.promises.rm(path.join(sessionDir, file), { recursive: true, force: true }).catch(() => {});
+    }
+  } catch {}
+}
 
 async function backupSessionToSupabase(sessionDir) {
   if (!isSupabaseConfigured) return false;
@@ -492,7 +580,7 @@ async function backupSessionToSupabase(sessionDir) {
     const files = await fs.promises.readdir(sessionDir);
     const payload = {};
     for (const file of files) {
-      if (!file.endsWith('.json')) continue;
+      if (!file.endsWith('.json') || file === '_pairing_meta.json') continue;
       const content = await fs.promises.readFile(path.join(sessionDir, file), 'utf-8');
       payload[file] = content;
     }
@@ -516,7 +604,9 @@ async function restoreSessionFromSupabase(sessionDir) {
 
     await fs.promises.mkdir(sessionDir, { recursive: true });
     for (const [filename, content] of Object.entries(payload)) {
-      if (!filename.endsWith('.json') || filename.includes('/') || filename.includes('..')) continue;
+      if (!filename.endsWith('.json') || filename === '_pairing_meta.json' || filename.includes('/') || filename.includes('..')) {
+        continue;
+      }
       await fs.promises.writeFile(path.join(sessionDir, filename), String(content), 'utf-8');
     }
     console.log('☁️ Sesi WhatsApp dipulihkan dari Supabase!');
@@ -558,6 +648,31 @@ function clearRateLimitWatchers() {
   }
 }
 
+function startSupabaseSessionWatcher(sessionDir, runId) {
+  if (!isSupabaseConfigured) return;
+  clearRateLimitWatchers();
+  rateLimitWatchTimer = setInterval(async () => {
+    if (runId !== currentBotRunId || global.botStatus === 'Online') {
+      clearRateLimitWatchers();
+      return;
+    }
+    const restored = await restoreSessionFromSupabase(sessionDir);
+    if (restored) {
+      clearRateLimitWatchers();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      global.pairingError = null;
+      await savePairingMeta(sessionDir, {
+        retryCount: 0,
+        nextRetryAt: null,
+        rateLimitStopped: false,
+        initialCodeIssued: false,
+      });
+      console.log('☁️ Sesi baru ditemukan di Supabase! Menghubungkan bot...');
+      startBot({ allowRetryAttempt: false }).catch((err) => console.error('[Supabase session boot error]', err));
+    }
+  }, 20_000);
+}
+
 async function restartPairingSession() {
   currentBotRunId += 1;
   clearPairingState();
@@ -579,12 +694,18 @@ async function restartPairingSession() {
   }
 
   await new Promise((r) => setTimeout(r, 300));
-  const sessionDir = path.join(ROOT_DIR, 'session');
-  await fs.promises.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+  const sessionDir = resolveSessionDir();
+  await cleanAuthFilesOnly(sessionDir);
   await clearSupabaseSession();
+  await savePairingMeta(sessionDir, {
+    retryCount: 0,
+    nextRetryAt: null,
+    rateLimitStopped: false,
+    initialCodeIssued: false,
+  });
   isStartingBot = false;
   isRequestingPairing = false;
-  startBot().catch((err) => console.error('[Restart pairing error]', err));
+  startBot({ allowRetryAttempt: true }).catch((err) => console.error('[Restart pairing error]', err));
 }
 
 function extractIqError(frame) {
@@ -596,13 +717,19 @@ function extractIqError(frame) {
   return { code: String(code), text: String(text) };
 }
 
-async function requestFreshPairingCode(sock, phoneNumber, runId) {
+async function requestFreshPairingCode(sock, phoneNumber, runId, sessionDir) {
   if (!sock || sock.authState?.creds?.registered || !phoneNumber) return null;
   if (runId !== currentBotRunId || activeSock !== sock) return null;
   if (isRequestingPairing) return global.pairingCode;
 
   isRequestingPairing = true;
   global.pairingError = null;
+  const attemptTimestamp = Date.now();
+  await savePairingMeta(sessionDir, {
+    lastAttemptAt: attemptTimestamp,
+    nextRetryAt: null,
+    initialCodeIssued: true,
+  });
 
   let cleanupFrameListener = () => {};
   try {
@@ -648,14 +775,39 @@ async function requestFreshPairingCode(sock, phoneNumber, runId) {
     if (!iqResult.ok) {
       clearPairingState();
       if (iqResult.code === '429') {
-        global.pairingError =
-          'WhatsApp membatasi pairing sementara (429 rate-overlimit) pada nomor/IP server ini. Bot akan otomatis coba lagi 15 menit lagi, atau pair 1x dari HP/Laptop (Termux/PC) untuk auto-sync via Supabase.';
+        const currentRetries = pairingMetaCache.retryCount || 0;
+        if (currentRetries >= MAX_RATE_LIMIT_RETRIES) {
+          await savePairingMeta(sessionDir, {
+            nextRetryAt: null,
+            rateLimitStopped: true,
+          });
+          global.pairingError =
+            'Maksimal retry pairing (3x) sudah tercapai (429 rate-overlimit). Tunggu 1-2 jam sebelum pairing lagi.';
+          console.error(`❌ Server WhatsApp menolak pairing (429: rate-overlimit)`);
+          console.error(`🛑 Maksimal retry ${MAX_RATE_LIMIT_RETRIES}x tercapai. Tunggu 1-2 jam sebelum pairing lagi.`);
+        } else {
+          const waitMinutes =
+            RATE_LIMIT_BACKOFF_MINUTES[Math.min(currentRetries, RATE_LIMIT_BACKOFF_MINUTES.length - 1)];
+          const nextRetryAt = Date.now() + waitMinutes * 60 * 1000;
+          const nextRetryCount = currentRetries + 1;
+          await savePairingMeta(sessionDir, {
+            retryCount: nextRetryCount,
+            nextRetryAt,
+            rateLimitStopped: false,
+          });
+          global.pairingError = `Server WhatsApp menolak pairing (429 rate-overlimit). Retry ${nextRetryCount}/${MAX_RATE_LIMIT_RETRIES} dijadwalkan dalam ${waitMinutes} menit (${formatDateID(nextRetryAt)}).`;
+          console.error(`❌ Server WhatsApp menolak pairing (429: rate-overlimit)`);
+          console.log(
+            `⏳ Exponential backoff: tunggu ${waitMinutes} menit. Retry ${nextRetryCount}/${MAX_RATE_LIMIT_RETRIES} pada ${formatDateID(nextRetryAt)}`
+          );
+        }
       } else if (iqResult.code === '400' || iqResult.code === '404' || iqResult.code === '406') {
         global.pairingError = `Nomor ${phoneNumber} ditolak server WhatsApp (Error ${iqResult.code}: ${iqResult.text}). Pastikan nomor aktif di WhatsApp format 628xxx.`;
+        console.error(`❌ Server WhatsApp menolak pairing (${iqResult.code}: ${iqResult.text})`);
       } else {
         global.pairingError = `Gagal meminta kode pairing ke server WhatsApp (Error ${iqResult.code}: ${iqResult.text}).`;
+        console.error(`❌ Server WhatsApp menolak pairing (${iqResult.code}: ${iqResult.text})`);
       }
-      console.error(`❌ Server WhatsApp menolak pairing (${iqResult.code}: ${iqResult.text})`);
       return null;
     }
 
@@ -664,8 +816,10 @@ async function requestFreshPairingCode(sock, phoneNumber, runId) {
     global.pairingError = null;
     const formatted = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
     console.log(`✅ Server WhatsApp mengonfirmasi pairing untuk ${phoneNumber}`);
-    console.log(`KODE PAIRING KAMU: ${formatted} (berlaku 5 menit)`);
+    console.log(`KODE PAIRING KAMU: ${formatted} (berlaku 5 menit, diminta 1x pada ${formatDateID(attemptTimestamp)})`);
 
+    // Setelah 5 menit berlalu tanpa login, JANGAN spam request pairing baru otomatis;
+    // tandai expired dan biarkan user menekan "Buat Ulang Kode" jika ingin mencoba lagi.
     if (pairingRefreshTimer) {
       clearTimeout(pairingRefreshTimer);
     }
@@ -676,8 +830,9 @@ async function requestFreshPairingCode(sock, phoneNumber, runId) {
         !sock.authState?.creds?.registered &&
         !sock.authState?.creds?.account
       ) {
-        console.log('⏱️ Kode pairing 5 menit habis, membuat sesi pairing baru...');
-        restartPairingSession();
+        clearPairingState();
+        global.pairingError = 'Kode pairing 5 menit habis. Klik "Buat Ulang Kode" jika ingin meminta kode baru.';
+        console.log('⏱️ Kode pairing 5 menit habis. Bot tidak meminta kode ulang otomatis untuk menghindari rate-limit.');
       }
     }, PAIRING_DURATION_MS);
 
@@ -693,28 +848,88 @@ async function requestFreshPairingCode(sock, phoneNumber, runId) {
   }
 }
 
-async function startBot() {
+async function startBot(options = {}) {
+  const { allowRetryAttempt = false } = options;
   if (isStartingBot) return;
   isStartingBot = true;
   clearRateLimitWatchers();
   const runId = ++currentBotRunId;
 
   try {
-    const sessionDir = path.join(ROOT_DIR, 'session');
+    const sessionDir = resolveSessionDir();
+    await fs.promises.mkdir(sessionDir, { recursive: true });
+    await loadPairingMeta(sessionDir);
+
     const localCredsPath = path.join(sessionDir, 'creds.json');
+    let sessionSource = fs.existsSync(localCredsPath) ? 'Disk/Volume' : 'Tidak ada';
     if (!fs.existsSync(localCredsPath)) {
-      await restoreSessionFromSupabase(sessionDir);
+      const restored = await restoreSessionFromSupabase(sessionDir);
+      if (restored) sessionSource = 'Supabase Backup';
     }
 
     let { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
     // Jika sesi belum registered DAN belum punya creds.account (belum pair-success),
     // tapi sudah terlanjur menyimpan creds.me dari percobaan pairing sebelumnya,
-    // bersihkan agar Baileys memakai generateRegistrationNode (bukan generateLoginNode)
+    // bersihkan hanya file auth (pertahankan _pairing_meta.json)
     if (!state.creds.registered && !state.creds.account && state.creds.me) {
-      console.log('🧹 Membersihkan sisa sesi pairing lama yang belum selesai...');
-      await fs.promises.rm(sessionDir, { recursive: true, force: true });
+      console.log('🧹 Membersihkan sisa auth pairing yang belum selesai...');
+      await cleanAuthFilesOnly(sessionDir);
       ({ state, saveCreds } = await useMultiFileAuthState(sessionDir));
+    }
+
+    const isSessionValid = Boolean(state.creds.registered || state.creds.account);
+    const lastPairingLabel = pairingMetaCache.lastPairedAt
+      ? `${formatDateID(pairingMetaCache.lastPairedAt)} (berhasil)`
+      : pairingMetaCache.lastAttemptAt
+        ? `${formatDateID(pairingMetaCache.lastAttemptAt)} (permintaan kode)`
+        : 'Belum pernah';
+    const nextRetryLabel = pairingMetaCache.rateLimitStopped
+      ? 'STOP — Tunggu 1-2 jam sebelum pairing lagi'
+      : pairingMetaCache.nextRetryAt
+        ? formatDateID(pairingMetaCache.nextRetryAt)
+        : '-';
+
+    console.log(`📂 Status Session: ${isSessionValid ? `ADA (${sessionSource})` : 'TIDAK ADA (butuh pairing awal)'} | Path: ${sessionDir}`);
+    console.log(`🕒 Terakhir Pairing: ${lastPairingLabel} | Retry: ${pairingMetaCache.retryCount}/${MAX_RATE_LIMIT_RETRIES} | Retry Berikutnya: ${nextRetryLabel}`);
+
+    if (!isSessionValid) {
+      if (pairingMetaCache.rateLimitStopped) {
+        global.botStatus = 'Offline';
+        global.pairingError =
+          'Maksimal retry pairing (3x) sudah tercapai (429 rate-overlimit). Tunggu 1-2 jam sebelum pairing lagi.';
+        console.log('🛑 Tunggu 1-2 jam sebelum pairing lagi. Server web tetap aktif tanpa restart loop.');
+        startSupabaseSessionWatcher(sessionDir, runId);
+        return;
+      }
+
+      if (pairingMetaCache.nextRetryAt && pairingMetaCache.nextRetryAt > Date.now()) {
+        const waitMs = pairingMetaCache.nextRetryAt - Date.now();
+        global.botStatus = 'Offline';
+        global.pairingError = `Masa tunggu anti rate-limit 429 aktif. Retry ${pairingMetaCache.retryCount}/${MAX_RATE_LIMIT_RETRIES} pada ${formatDateID(pairingMetaCache.nextRetryAt)}.`;
+        console.log(`⏳ Menunggu backoff 429. Retry berikutnya pada ${formatDateID(pairingMetaCache.nextRetryAt)} (${Math.ceil(waitMs / 60000)} menit lagi).`);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => {
+          if (runId === currentBotRunId) {
+            startBot({ allowRetryAttempt: true }).catch((err) => console.error('[Backoff retry error]', err));
+          }
+        }, waitMs);
+        startSupabaseSessionWatcher(sessionDir, runId);
+        return;
+      }
+
+      const hasDueScheduledRetry = Boolean(
+        pairingMetaCache.nextRetryAt && pairingMetaCache.nextRetryAt <= Date.now()
+      );
+
+      if (pairingMetaCache.initialCodeIssued && !allowRetryAttempt && !hasDueScheduledRetry) {
+        global.botStatus = 'Offline';
+        global.pairingError =
+          'Pairing code sudah pernah diminta 1x sebelumnya. Klik "Buat Ulang Kode" jika ingin meminta kode baru.';
+        console.log('ℹ️ Pairing code sudah pernah diminta 1x saat setup. Bot tidak meminta kode baru otomatis saat restart agar tidak terkena rate-limit.');
+        startSupabaseSessionWatcher(sessionDir, runId);
+        return;
+      }
     }
 
     if (runId !== currentBotRunId) return;
@@ -805,7 +1020,7 @@ async function startBot() {
       }
       pairingRequestedForThisSocket = true;
       console.log(`📲 Meminta kode pairing untuk nomor: ${phoneNumber}`);
-      requestFreshPairingCode(sock, phoneNumber, runId);
+      requestFreshPairingCode(sock, phoneNumber, runId, sessionDir);
     };
 
     sock.ev.on('connection.update', async (update) => {
@@ -825,10 +1040,17 @@ async function startBot() {
         clearRateLimitWatchers();
         global.botName = sock.user?.name || 'SPIVER BOT';
         global.botNumber = cleanNumber((sock.user?.id || '').split(':')[0] || phoneNumber);
+        await savePairingMeta(sessionDir, {
+          retryCount: 0,
+          lastPairedAt: Date.now(),
+          nextRetryAt: null,
+          rateLimitStopped: false,
+          initialCodeIssued: false,
+        });
         console.log(`✅ SPIVER BOT Online sebagai ${global.botName} (${global.botNumber})`);
         const synced = await backupSessionToSupabase(sessionDir);
         if (synced) {
-          console.log('☁️ Sesi WhatsApp tersinkron ke Supabase (aman saat redeploy).');
+          console.log(`☁️ Sesi WhatsApp tersimpan permanen di ${sessionDir} & Supabase.`);
         }
       } else if (connection === 'close') {
         global.botStatus = 'Offline';
@@ -844,57 +1066,75 @@ async function startBot() {
         }
 
         if (isLoggedOut) {
-          global.pairingError = 'Sesi WhatsApp keluar (401). Membuat sesi pairing baru...';
+          global.pairingError = 'Sesi WhatsApp keluar (401). Silakan klik "Buat Ulang Kode" untuk pairing baru.';
           clearPairingState();
           await saveCredsChain;
-          await fs.promises.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+          await cleanAuthFilesOnly(sessionDir);
           await clearSupabaseSession();
-        } else if (isPairedPendingRestart) {
-          await saveCredsChain;
+          await savePairingMeta(sessionDir, {
+            retryCount: 0,
+            nextRetryAt: null,
+            rateLimitStopped: false,
+            initialCodeIssued: false,
+          });
+          console.log('🔓 Sesi WhatsApp logged out (401). Session lama dibersihkan; klik "Buat Ulang Kode" untuk pairing ulang.');
+          return;
         }
 
-        const isRateLimited = Boolean(global.pairingError && global.pairingError.includes('429'));
-        if (isRateLimited) {
-          console.log(
-            '⏸️ WhatsApp rate-limit (429) terdeteksi. Menjadwalkan coba ulang otomatis dalam 15 menit (JANGAN redeploy terus agar timer 429 tidak reset).'
-          );
-          console.log(
-            '💡 Tips cepat jika IP Railway dibatasi: jalankan "node bot/index.js" 1x dari Termux/Laptop dengan .env yang sama — sesi otomatis masuk ke Supabase & Railway langsung Online!'
-          );
-
+        if (isPairedPendingRestart) {
+          await saveCredsChain;
+          const delayMs = isRestartRequired ? 1200 : 4000;
           if (reconnectTimer) clearTimeout(reconnectTimer);
           reconnectTimer = setTimeout(() => {
             if (runId === currentBotRunId) {
-              global.pairingError = null;
-              startBot().catch((err) => console.error('[Cooldown retry error]', err));
-            }
-          }, RATE_LIMIT_COOLDOWN_MS);
-
-          // Cek berkala setiap 15 detik apakah user sudah pairing dari Termux/Laptop dan tersimpan di Supabase
-          clearRateLimitWatchers();
-          rateLimitWatchTimer = setInterval(async () => {
-            if (runId !== currentBotRunId || global.botStatus === 'Online') {
-              clearRateLimitWatchers();
-              return;
-            }
-            const restored = await restoreSessionFromSupabase(sessionDir);
-            if (restored) {
-              clearRateLimitWatchers();
-              if (reconnectTimer) clearTimeout(reconnectTimer);
-              global.pairingError = null;
-              console.log('☁️ Sesi baru ditemukan di Supabase! Menghubungkan bot...');
-              startBot().catch((err) => console.error('[Supabase session boot error]', err));
-            }
-          }, 15_000);
-        } else {
-          const delayMs = isRestartRequired ? 1200 : isLoggedOut ? 2500 : 5000;
-          if (reconnectTimer) clearTimeout(reconnectTimer);
-          reconnectTimer = setTimeout(() => {
-            if (runId === currentBotRunId) {
-              startBot().catch((err) => console.error('[Reconnect error]', err));
+              startBot({ allowRetryAttempt: false }).catch((err) => console.error('[Reconnect error]', err));
             }
           }, delayMs);
+          return;
         }
+
+        // Belum registered: cek apakah baru saja kena 429
+        const isRateLimited = Boolean(global.pairingError && global.pairingError.includes('429'));
+        if (isRateLimited) {
+          if (pairingMetaCache.rateLimitStopped) {
+            console.log('🛑 Tunggu 1-2 jam sebelum pairing lagi. Tidak ada auto-retry atau crash loop.');
+            startSupabaseSessionWatcher(sessionDir, runId);
+          } else if (pairingMetaCache.nextRetryAt && pairingMetaCache.nextRetryAt > Date.now()) {
+            const waitMs = pairingMetaCache.nextRetryAt - Date.now();
+            console.log(
+              `⏸️ Auto-retry dijadwalkan pada ${formatDateID(pairingMetaCache.nextRetryAt)} (${Math.ceil(waitMs / 60000)} menit lagi).`
+            );
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => {
+              if (runId === currentBotRunId) {
+                global.pairingError = null;
+                startBot({ allowRetryAttempt: true }).catch((err) => console.error('[Backoff retry error]', err));
+              }
+            }, waitMs);
+            startSupabaseSessionWatcher(sessionDir, runId);
+          }
+          return;
+        }
+
+        // Jika sudah pernah minta pairing code 1x di sesi setup ini dan terputus (misal 408/428),
+        // JANGAN langsung minta pairing code baru otomatis agar tidak memicu rate-limit.
+        if (pairingRequestedForThisSocket) {
+          if (!global.pairingError) {
+            global.pairingError = 'Koneksi pairing terputus sebelum ditautkan. Klik "Buat Ulang Kode" jika perlu kode baru.';
+          }
+          console.log('⏸️ Pairing code sudah diminta 1x dan koneksi ditutup tanpa tautan. Tidak auto-request lagi untuk mencegah rate-limit.');
+          startSupabaseSessionWatcher(sessionDir, runId);
+          return;
+        }
+
+        // Jika socket putus bahkan sebelum sempat mengirim pairing code (error jaringan sebelum QR),
+        // retry 1x setelah jeda aman 10 detik.
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => {
+          if (runId === currentBotRunId) {
+            startBot({ allowRetryAttempt }).catch((err) => console.error('[Reconnect error]', err));
+          }
+        }, 10_000);
       }
     });
 

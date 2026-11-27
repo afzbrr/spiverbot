@@ -18,6 +18,11 @@ interface PairingInfo {
   status: string;
   expiresAt?: number | null;
   remainingSeconds?: number;
+  sessionExists?: boolean;
+  nextRetryAt?: number | null;
+  retryCount?: number;
+  maxRetries?: number;
+  rateLimitStopped?: boolean;
 }
 
 interface MenuEntry {
@@ -108,7 +113,9 @@ export default function App() {
     pairingData.status === 'Online'
       ? 'Perangkat sudah tertaut'
       : pairingData.code
-        ? `Berlaku ${String(Math.floor(remainingSec / 60)).padStart(2, '0')}:${String(remainingSec % 60).padStart(2, '0')}`
+        ? remainingSec > 0
+          ? `Berlaku ${String(Math.floor(remainingSec / 60)).padStart(2, '0')}:${String(remainingSec % 60).padStart(2, '0')}`
+          : 'Kode habis, klik Buat Ulang Kode'
         : 'Masa berlaku kode: 05:00';
 
   const handleRefreshPairing = async () => {

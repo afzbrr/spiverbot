@@ -50,6 +50,11 @@ async function startDevServer() {
       expiresAt: null,
       remainingSeconds: 300,
       ttlMs: 300000,
+      sessionExists: false,
+      nextRetryAt: null,
+      retryCount: 0,
+      maxRetries: 3,
+      rateLimitStopped: false,
     });
   });
 

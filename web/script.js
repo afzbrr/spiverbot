@@ -49,7 +49,7 @@ function updateCountdownText() {
   const diffSec = Math.max(0, Math.floor((currentExpiresAt - Date.now()) / 1000));
   const mins = String(Math.floor(diffSec / 60)).padStart(2, '0');
   const secs = String(diffSec % 60).padStart(2, '0');
-  countdownEl.textContent = diffSec > 0 ? `Berlaku ${mins}:${secs}` : 'Kode habis, membuat kode baru...';
+  countdownEl.textContent = diffSec > 0 ? `Berlaku ${mins}:${secs}` : 'Kode habis, klik Buat Ulang Kode';
 }
 
 async function fetchDashboardData() {
