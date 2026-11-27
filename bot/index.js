@@ -4,10 +4,12 @@ import makeWASocket, {
   DisconnectReason,
   downloadMediaMessage,
   jidNormalizedUser,
+  Browsers,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import express from 'express';
 import dotenv from 'dotenv';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import sharp from 'sharp';
@@ -149,7 +151,11 @@ function getGeminiClient() {
 }
 
 function cleanNumber(raw) {
-  return String(raw || '').replace(/[^0-9]/g, '');
+  let digits = String(raw || '').replace(/[^0-9]/g, '');
+  if (digits.startsWith('0')) {
+    digits = '62' + digits.slice(1);
+  }
+  return digits;
 }
 
 function toJid(number) {
@@ -466,7 +472,17 @@ async function startBot() {
   if (isStartingBot) return;
   isStartingBot = true;
   try {
-    const { state, saveCreds } = await useMultiFileAuthState('session');
+    const sessionDir = path.join(ROOT_DIR, 'session');
+    let { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+    // Jika sesi belum registered tapi sudah terlanjur menyimpan creds.me dari percobaan pairing sebelumnya,
+    // bersihkan agar Baileys memakai generateRegistrationNode (bukan generateLoginNode)
+    if (!state.creds.registered && state.creds.me) {
+      console.log('🧹 Membersihkan sisa sesi pairing lama yang belum selesai...');
+      await fs.promises.rm(sessionDir, { recursive: true, force: true });
+      ({ state, saveCreds } = await useMultiFileAuthState(sessionDir));
+    }
+
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -474,7 +490,7 @@ async function startBot() {
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
       auth: state,
-      browser: ['Ubuntu', 'Chrome', '20.0.04'],
+      browser: Browsers.ubuntu('Chrome'),
       qrTimeout: PAIRING_DURATION_MS,
       connectTimeoutMs: PAIRING_DURATION_MS,
       defaultQueryTimeoutMs: 120_000,
@@ -485,20 +501,28 @@ async function startBot() {
     activeSock = sock;
 
     const phoneNumber = cleanNumber(process.env.PHONE_NUMBER);
-    if (!sock.authState.creds.registered) {
+    let pairingRequestedForThisSocket = false;
+
+    const triggerPairingOnce = () => {
+      if (pairingRequestedForThisSocket || sock.authState.creds.registered) return;
       if (!phoneNumber) {
         console.log('⚠️ PHONE_NUMBER belum diisi di .env (format: 628xxx). Pairing code tidak bisa dibuat.');
-      } else {
-        setTimeout(() => {
-          requestFreshPairingCode(sock, phoneNumber, true);
-        }, 3000);
+        return;
       }
-    }
+      pairingRequestedForThisSocket = true;
+      console.log(`📲 Meminta kode pairing untuk nomor: ${phoneNumber}`);
+      requestFreshPairingCode(sock, phoneNumber, true);
+    };
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect } = update;
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr && !sock.authState.creds.registered && !pairingRequestedForThisSocket) {
+        setTimeout(triggerPairingOnce, 500);
+      }
+
       if (connection === 'connecting') {
         global.botStatus = 'Connecting';
       } else if (connection === 'open') {
@@ -515,14 +539,18 @@ async function startBot() {
       } else if (connection === 'close') {
         global.botStatus = 'Offline';
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const isRestartRequired = statusCode === DisconnectReason.restartRequired;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
+        const shouldReconnect = !isLoggedOut;
         console.log('❌ Koneksi terputus. Reconnect:', shouldReconnect, 'Code:', statusCode);
-        if (statusCode === DisconnectReason.loggedOut) {
+
+        if (isLoggedOut) {
           global.pairingCode = null;
           global.pairingExpiresAt = null;
+          await fs.promises.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
         }
         if (shouldReconnect) {
-          setTimeout(() => startBot(), 5000);
+          setTimeout(() => startBot(), isRestartRequired ? 500 : 3000);
         }
       }
     });
