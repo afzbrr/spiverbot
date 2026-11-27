@@ -46,6 +46,21 @@ async function startDevServer() {
       code: null,
       phoneNumber: rawPhone || '',
       status: rawPhone ? 'Connecting' : 'Offline',
+      expiresAt: null,
+      remainingSeconds: 300,
+      ttlMs: 300000,
+    });
+  });
+
+  app.post('/api/pairing/refresh', (req, res) => {
+    const rawPhone = (process.env.PHONE_NUMBER || '').replace(/[^0-9]/g, '');
+    res.json({
+      code: null,
+      phoneNumber: rawPhone || '',
+      status: rawPhone ? 'Connecting' : 'Offline',
+      expiresAt: Date.now() + 300000,
+      remainingSeconds: 300,
+      ttlMs: 300000,
     });
   });
 

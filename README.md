@@ -65,7 +65,6 @@ Edit file `.env` dan isi nomor WhatsApp format internasional tanpa `+` atau spas
 PHONE_NUMBER=6281234567890
 OWNER_NUMBER=6281234567890
 GEMINI_API_KEY=isi_api_key_gemini_kamu
-DOWNLOADER_API_KEY=isi_api_key_downloader_kamu
 SUPABASE_URL=https://xxxx.supabase.co
 SUPABASE_ANON_KEY=eyJxxxx
 PORT=3000
@@ -108,7 +107,6 @@ git push -u origin main
    - `PHONE_NUMBER`
    - `OWNER_NUMBER`
    - `GEMINI_API_KEY`
-   - `DOWNLOADER_API_KEY`
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
    - `PORT=3000`

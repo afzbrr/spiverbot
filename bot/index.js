@@ -54,11 +54,7 @@ import {
   getStats,
 } from './db.js';
 import { startGame, handleGameAnswerOrSurrender } from './games.js';
-import {
-  isSupportedDownloadCommand,
-  downloadMediaFromUrl,
-  convertVideoBufferToAudio,
-} from './downloader.js';
+import { download, getAudio, mapping as downloadMapping } from './downloader.js';
 
 dotenv.config();
 
@@ -67,14 +63,54 @@ const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, '..');
 const WEB_DIR = path.join(ROOT_DIR, 'web');
 
+const PAIRING_DURATION_MS = 5 * 60 * 1000; // 5 menit
+
 global.pairingCode = global.pairingCode || null;
+global.pairingExpiresAt = global.pairingExpiresAt || null;
 global.botStatus = global.botStatus || 'Offline';
 global.botName = global.botName || 'SPIVER BOT';
 global.botNumber = global.botNumber || (process.env.PHONE_NUMBER || '').replace(/[^0-9]/g, '');
 
+let activeSock = null;
+let pairingRefreshTimer = null;
+let isRequestingPairing = false;
+let isStartingBot = false;
+
 const groupChatCounter = new Map();
 const groupLastActive = new Map();
 const groupBirthdays = new Map();
+const downloadCache = new Map();
+
+function pickUrlValue(val) {
+  if (!val) return null;
+  if (typeof val === 'string' && val.startsWith('http')) return val;
+  if (Array.isArray(val)) {
+    for (const item of val) {
+      const found = pickUrlValue(item);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof val === 'object') {
+    return pickUrlValue(val.url || val.nowm || val.hd || val.sd || val.download || val.link);
+  }
+  return null;
+}
+
+function detectPlatformFromUrl(url) {
+  const lower = String(url || '').toLowerCase();
+  if (lower.includes('tiktok.com')) return 'tiktok';
+  if (lower.includes('instagram.com')) return 'instagram';
+  if (lower.includes('youtu.be') || lower.includes('youtube.com')) return 'youtube';
+  if (lower.includes('facebook.com') || lower.includes('fb.watch')) return 'facebook';
+  if (lower.includes('spotify.com')) return 'spotify';
+  if (lower.includes('pinterest.com') || lower.includes('pin.it')) return 'pinterest';
+  if (lower.includes('capcut.com')) return 'capcut';
+  if (lower.includes('threads.net')) return 'threads';
+  if (lower.includes('twitter.com') || lower.includes('x.com')) return 'twitter';
+  if (lower.includes('music.apple.com')) return 'applemusic';
+  return 'tiktok';
+}
 
 const EXEMPT_LIMIT_COMMANDS = new Set([
   'start',
@@ -326,10 +362,48 @@ async function startExpressServer() {
   });
 
   app.get('/api/pairing', (req, res) => {
+    const now = Date.now();
+    const expiresAt = global.pairingExpiresAt || null;
+    const remainingSeconds =
+      expiresAt && global.pairingCode && global.botStatus !== 'Online'
+        ? Math.max(0, Math.floor((expiresAt - now) / 1000))
+        : 0;
     res.json({
       code: global.pairingCode || null,
       phoneNumber: cleanNumber(process.env.PHONE_NUMBER) || '',
       status: global.botStatus || 'Offline',
+      expiresAt,
+      remainingSeconds,
+      ttlMs: PAIRING_DURATION_MS,
+    });
+  });
+
+  app.post('/api/pairing/refresh', async (req, res) => {
+    const phoneNumber = cleanNumber(process.env.PHONE_NUMBER);
+    if (!phoneNumber) {
+      return res.status(400).json({ error: 'PHONE_NUMBER belum diisi di .env' });
+    }
+    if (!activeSock || activeSock.authState?.creds?.registered) {
+      return res.json({
+        code: null,
+        phoneNumber,
+        status: global.botStatus || 'Online',
+        expiresAt: null,
+        remainingSeconds: 0,
+        ttlMs: PAIRING_DURATION_MS,
+      });
+    }
+    const code = await requestFreshPairingCode(activeSock, phoneNumber, true);
+    const remainingSeconds = global.pairingExpiresAt
+      ? Math.max(0, Math.floor((global.pairingExpiresAt - Date.now()) / 1000))
+      : 0;
+    return res.json({
+      code,
+      phoneNumber,
+      status: global.botStatus || 'Connecting',
+      expiresAt: global.pairingExpiresAt,
+      remainingSeconds,
+      ttlMs: PAIRING_DURATION_MS,
     });
   });
 
@@ -353,57 +427,105 @@ async function startExpressServer() {
   });
 }
 
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('session');
-  const { version } = await fetchLatestBaileysVersion();
+async function requestFreshPairingCode(sock, phoneNumber, force = false) {
+  if (!sock || sock.authState?.creds?.registered || !phoneNumber) return null;
+  if (isRequestingPairing) return global.pairingCode;
 
-  const sock = makeWASocket({
-    version,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false,
-    auth: state,
-    browser: ['Ubuntu', 'Chrome', '20.0.04'],
-  });
-
-  const phoneNumber = cleanNumber(process.env.PHONE_NUMBER);
-  if (!sock.authState.creds.registered) {
-    if (!phoneNumber) {
-      console.log('⚠️ PHONE_NUMBER belum diisi di .env (format: 628xxx). Pairing code tidak bisa dibuat.');
-    } else {
-      setTimeout(async () => {
-        try {
-          const code = await sock.requestPairingCode(phoneNumber);
-          console.log('KODE PAIRING KAMU:', code);
-          global.pairingCode = code;
-        } catch (e) {
-          console.log('Gagal minta pairing code', e);
-        }
-      }, 3000);
-    }
+  const now = Date.now();
+  if (!force && global.pairingCode && global.pairingExpiresAt && now < global.pairingExpiresAt) {
+    return global.pairingCode;
   }
 
-  sock.ev.on('creds.update', saveCreds);
+  isRequestingPairing = true;
+  try {
+    const code = await sock.requestPairingCode(phoneNumber);
+    global.pairingCode = code;
+    global.pairingExpiresAt = Date.now() + PAIRING_DURATION_MS;
+    console.log(`KODE PAIRING KAMU: ${code} (berlaku 5 menit)`);
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
-    if (connection === 'connecting') {
-      global.botStatus = 'Connecting';
-    } else if (connection === 'open') {
-      global.botStatus = 'Online';
-      global.pairingCode = null;
-      global.botName = sock.user?.name || 'SPIVER BOT';
-      global.botNumber = cleanNumber((sock.user?.id || '').split(':')[0] || phoneNumber);
-      console.log(`✅ SPIVER BOT Online sebagai ${global.botName} (${global.botNumber})`);
-    } else if (connection === 'close') {
-      global.botStatus = 'Offline';
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log('❌ Koneksi terputus. Reconnect:', shouldReconnect);
-      if (shouldReconnect) {
-        setTimeout(() => startBot(), 3000);
+    if (pairingRefreshTimer) {
+      clearTimeout(pairingRefreshTimer);
+    }
+    pairingRefreshTimer = setTimeout(() => {
+      if (activeSock && !activeSock.authState?.creds?.registered) {
+        console.log('⏱️ Kode pairing 5 menit habis, membuat kode pairing baru...');
+        requestFreshPairingCode(activeSock, phoneNumber, true);
+      }
+    }, PAIRING_DURATION_MS);
+
+    return code;
+  } catch (e) {
+    console.log('Gagal minta pairing code', e);
+    return global.pairingCode || null;
+  } finally {
+    isRequestingPairing = false;
+  }
+}
+
+async function startBot() {
+  if (isStartingBot) return;
+  isStartingBot = true;
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState('session');
+    const { version } = await fetchLatestBaileysVersion();
+
+    const sock = makeWASocket({
+      version,
+      logger: pino({ level: 'silent' }),
+      printQRInTerminal: false,
+      auth: state,
+      browser: ['Ubuntu', 'Chrome', '20.0.04'],
+      qrTimeout: PAIRING_DURATION_MS,
+      connectTimeoutMs: PAIRING_DURATION_MS,
+      defaultQueryTimeoutMs: 120_000,
+      keepAliveIntervalMs: 25_000,
+      syncFullHistory: false,
+    });
+
+    activeSock = sock;
+
+    const phoneNumber = cleanNumber(process.env.PHONE_NUMBER);
+    if (!sock.authState.creds.registered) {
+      if (!phoneNumber) {
+        console.log('⚠️ PHONE_NUMBER belum diisi di .env (format: 628xxx). Pairing code tidak bisa dibuat.');
+      } else {
+        setTimeout(() => {
+          requestFreshPairingCode(sock, phoneNumber, true);
+        }, 3000);
       }
     }
-  });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect } = update;
+      if (connection === 'connecting') {
+        global.botStatus = 'Connecting';
+      } else if (connection === 'open') {
+        global.botStatus = 'Online';
+        global.pairingCode = null;
+        global.pairingExpiresAt = null;
+        if (pairingRefreshTimer) {
+          clearTimeout(pairingRefreshTimer);
+          pairingRefreshTimer = null;
+        }
+        global.botName = sock.user?.name || 'SPIVER BOT';
+        global.botNumber = cleanNumber((sock.user?.id || '').split(':')[0] || phoneNumber);
+        console.log(`✅ SPIVER BOT Online sebagai ${global.botName} (${global.botNumber})`);
+      } else if (connection === 'close') {
+        global.botStatus = 'Offline';
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        console.log('❌ Koneksi terputus. Reconnect:', shouldReconnect, 'Code:', statusCode);
+        if (statusCode === DisconnectReason.loggedOut) {
+          global.pairingCode = null;
+          global.pairingExpiresAt = null;
+        }
+        if (shouldReconnect) {
+          setTimeout(() => startBot(), 5000);
+        }
+      }
+    });
 
   // Anti Call Handler
   sock.ev.on('call', async (calls) => {
@@ -828,65 +950,159 @@ async function startBot() {
         }
 
         // ============================================================
-        // 3. DOWNLOADER COMMANDS
+        // 3. DOWNLOADER COMMANDS (SIPUTZX NO KEY)
         // ============================================================
-        if (isSupportedDownloadCommand(cmd)) {
+        const dotCmd = `.${cmd}`;
+        if (Object.prototype.hasOwnProperty.call(downloadMapping, dotCmd)) {
           const link = args[0];
           if (!link) {
-            await reply(`Cara pakai: .${cmd} <link>`);
+            await reply('Kirim linknya. Contoh: .tiktok https://...');
             continue;
           }
-          await reply('⏳ Sedang mengunduh media tanpa watermark...');
-          try {
-            const items = await downloadMediaFromUrl(cmd, link);
-            for (const item of items) {
-              if (item.type === 'image') {
-                await sock.sendMessage(
+
+          await reply('⏳ Lagi download, tunggu ya...');
+          const type = downloadMapping[dotCmd];
+          const resData = await download(type, link);
+
+          if (!resData || resData.status === false) {
+            await reply('Gagal download, linknya salah kali 😭');
+            continue;
+          }
+
+          const payload = resData.data || resData.result || resData;
+          const audioUrl = pickUrlValue(payload?.audio || payload?.music || payload?.mp3);
+          const caption = '✅ Tanpa watermark\nReply video ini dengan .toaudio untuk download audionya';
+          let sentAnyMedia = false;
+
+          if (Array.isArray(payload)) {
+            for (const item of payload) {
+              const videoUrl = pickUrlValue(item?.video || item?.video_url);
+              const imageUrl = pickUrlValue(item?.image || item?.photo || item?.thumbnail) ||
+                (typeof item === 'string' && item.startsWith('http') ? item : pickUrlValue(item?.url));
+
+              if (videoUrl) {
+                const sent = await sock.sendMessage(
                   chatId,
-                  { image: { url: item.url }, caption: item.caption || '' },
+                  { video: { url: videoUrl }, caption },
                   { quoted: msg }
                 );
-              } else if (item.type === 'audio') {
+                if (sent?.key?.id) {
+                  downloadCache.set(sent.key.id, { audioUrl: audioUrl || pickUrlValue(item?.audio || item?.music), type, url: link });
+                }
+                sentAnyMedia = true;
+              } else if (imageUrl) {
                 await sock.sendMessage(
                   chatId,
-                  { audio: { url: item.url }, mimetype: 'audio/mpeg' },
+                  { image: { url: imageUrl }, caption },
                   { quoted: msg }
                 );
-              } else {
-                await sock.sendMessage(
-                  chatId,
-                  { video: { url: item.url }, caption: item.caption || '' },
-                  { quoted: msg }
-                );
+                sentAnyMedia = true;
               }
             }
-          } catch {
-            await reply('Gagal download');
+          } else if (payload && typeof payload === 'object') {
+            const videoUrl = pickUrlValue(
+              payload.video ||
+                payload.video_url ||
+                payload.nowm ||
+                payload.hd ||
+                payload.sd ||
+                (typeof payload.url === 'string' && !/\.(jpg|jpeg|png|webp)(\?|$)/i.test(payload.url)
+                  ? payload.url
+                  : null)
+            );
+            const imageArray = Array.isArray(payload.images)
+              ? payload.images
+              : Array.isArray(payload.photos)
+                ? payload.photos
+                : null;
+            const singleImageUrl = pickUrlValue(payload.image || payload.photo || payload.thumbnail);
+
+            if (imageArray && imageArray.length > 0 && !videoUrl) {
+              for (const img of imageArray) {
+                const imgUrl = pickUrlValue(img);
+                if (imgUrl) {
+                  await sock.sendMessage(
+                    chatId,
+                    { image: { url: imgUrl }, caption },
+                    { quoted: msg }
+                  );
+                  sentAnyMedia = true;
+                }
+              }
+            } else if (videoUrl) {
+              const sent = await sock.sendMessage(
+                chatId,
+                { video: { url: videoUrl }, caption },
+                { quoted: msg }
+              );
+              if (sent?.key?.id) {
+                downloadCache.set(sent.key.id, { audioUrl, type, url: link });
+              }
+              sentAnyMedia = true;
+            } else if (singleImageUrl) {
+              const sent = await sock.sendMessage(
+                chatId,
+                { image: { url: singleImageUrl }, caption },
+                { quoted: msg }
+              );
+              if (sent?.key?.id && audioUrl) {
+                downloadCache.set(sent.key.id, { audioUrl, type, url: link });
+              }
+              sentAnyMedia = true;
+            } else if (audioUrl) {
+              const sent = await reply(caption);
+              if (sent?.key?.id) {
+                downloadCache.set(sent.key.id, { audioUrl, type, url: link });
+              }
+              sentAnyMedia = true;
+            }
+          }
+
+          if (!sentAnyMedia) {
+            await reply('Gagal download, linknya salah kali 😭');
           }
           continue;
         }
 
         if (cmd === 'toaudio') {
           const quoted = getQuotedInfo(msg);
-          const videoMsg = msg.message.videoMessage || quoted?.message?.videoMessage;
-          if (!videoMsg) {
-            await reply('❌ Reply video dengan *.toaudio* untuk mengambil audionya.');
+          const hasQuotedVideo = Boolean(quoted?.message?.videoMessage);
+          const cached = quoted?.stanzaId ? downloadCache.get(quoted.stanzaId) : null;
+
+          if (!quoted || (!hasQuotedVideo && !cached)) {
+            await reply('Reply video download-an tadi dengan .toaudio');
             continue;
           }
-          try {
-            const targetMsg = msg.message.videoMessage
-              ? msg
-              : { key: { remoteJid: chatId, id: quoted.stanzaId }, message: quoted.message };
-            const vidBuffer = await downloadMediaMessage(targetMsg, 'buffer', {});
-            const audioBuffer = await convertVideoBufferToAudio(vidBuffer);
-            await sock.sendMessage(
-              chatId,
-              { audio: audioBuffer, mimetype: 'audio/mpeg' },
-              { quoted: msg }
-            );
-          } catch {
-            await reply('Gagal download');
+
+          let audioUrl = cached?.audioUrl || null;
+          if (!audioUrl && cached?.type && cached?.url) {
+            audioUrl = await getAudio(cached.type, cached.url);
           }
+
+          if (!audioUrl) {
+            const quotedText =
+              quoted.message?.videoMessage?.caption ||
+              quoted.message?.imageMessage?.caption ||
+              quoted.message?.conversation ||
+              quoted.message?.extendedTextMessage?.text ||
+              '';
+            const urlMatch = quotedText.match(/https?:\/\/\S+/i);
+            if (urlMatch) {
+              const detectedType = detectPlatformFromUrl(urlMatch[0]);
+              audioUrl = await getAudio(detectedType, urlMatch[0]);
+            }
+          }
+
+          if (!audioUrl) {
+            await reply('Gak ada audionya di video ini 😭');
+            continue;
+          }
+
+          await sock.sendMessage(
+            chatId,
+            { audio: { url: audioUrl }, mimetype: 'audio/mp4' },
+            { quoted: msg }
+          );
           continue;
         }
 
@@ -1877,6 +2093,9 @@ async function startBot() {
       }
     }
   });
+  } finally {
+    isStartingBot = false;
+  }
 }
 
 startExpressServer();

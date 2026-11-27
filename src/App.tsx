@@ -15,6 +15,8 @@ interface PairingInfo {
   code: string | null;
   phoneNumber: string;
   status: string;
+  expiresAt?: number | null;
+  remainingSeconds?: number;
 }
 
 interface MenuEntry {
@@ -49,8 +51,10 @@ export default function App() {
   const [menus, setMenus] = useState<MenuEntry[]>([]);
   const [selectedMenuId, setSelectedMenuId] = useState<string>('main');
   const [loading, setLoading] = useState<boolean>(true);
+  const [refreshingPairing, setRefreshingPairing] = useState<boolean>(false);
   const [copiedPairing, setCopiedPairing] = useState<boolean>(false);
   const [copiedGithub, setCopiedGithub] = useState<boolean>(false);
+  const [remainingSec, setRemainingSec] = useState<number>(300);
 
   const loadData = async () => {
     setLoading(true);
@@ -64,7 +68,13 @@ export default function App() {
         setStatusData(await statusRes.json());
       }
       if (pairingRes.ok) {
-        setPairingData(await pairingRes.json());
+        const p: PairingInfo = await pairingRes.json();
+        setPairingData(p);
+        if (typeof p.remainingSeconds === 'number') {
+          setRemainingSec(p.remainingSeconds);
+        } else if (p.expiresAt) {
+          setRemainingSec(Math.max(0, Math.floor((p.expiresAt - Date.now()) / 1000)));
+        }
       }
       if (menuRes.ok) {
         const parsed = await menuRes.json();
@@ -83,8 +93,37 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    const tick = setInterval(() => {
+      setRemainingSec((prev) => (prev > 0 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(tick);
+  }, []);
+
   const displayedCode = formatCode(pairingData.code, pairingData.status);
   const activeMenu = menus.find((m) => m.id === selectedMenuId) || menus[0];
+  const countdownLabel =
+    pairingData.status === 'Online'
+      ? 'Perangkat sudah tertaut'
+      : pairingData.code
+        ? `Berlaku ${String(Math.floor(remainingSec / 60)).padStart(2, '0')}:${String(remainingSec % 60).padStart(2, '0')}`
+        : 'Masa berlaku kode: 05:00';
+
+  const handleRefreshPairing = async () => {
+    setRefreshingPairing(true);
+    try {
+      const res = await fetch('/api/pairing/refresh', { method: 'POST' });
+      if (res.ok) {
+        const p: PairingInfo = await res.json();
+        setPairingData(p);
+        setRemainingSec(p.remainingSeconds ?? 300);
+      }
+    } catch {
+      // Abaikan jika gagal
+    } finally {
+      setRefreshingPairing(false);
+    }
+  };
 
   const handleCopyPairing = async () => {
     try {
@@ -220,16 +259,17 @@ export default function App() {
               </p>
             </div>
 
-            <div className="bg-[#182235] border border-slate-700/70 rounded-xl py-7 px-5 text-center">
-              <span className="block text-xs font-medium tracking-wider text-slate-400 mb-2">
+            <div className="bg-[#182235] border border-slate-700/70 rounded-xl py-7 px-5 text-center space-y-2">
+              <span className="block text-xs font-medium tracking-wider text-slate-400">
                 KODE PAIRING
               </span>
               <div className="text-3xl sm:text-4xl font-bold tracking-[0.16em] text-emerald-400 font-mono-tabular">
                 {displayedCode}
               </div>
+              <p className="text-xs text-slate-400 font-mono-tabular">{countdownLabel}</p>
             </div>
 
-            <div className="flex items-center gap-4">
+            <div className="flex flex-wrap items-center gap-3">
               <button
                 type="button"
                 onClick={handleCopyPairing}
@@ -238,8 +278,17 @@ export default function App() {
                 {copiedPairing ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                 {copiedPairing ? 'Kode Disalin' : 'Salin Kode Pairing'}
               </button>
+              <button
+                type="button"
+                onClick={handleRefreshPairing}
+                disabled={refreshingPairing}
+                className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold rounded-lg bg-[#182235] border border-slate-700 text-slate-100 hover:border-slate-500 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60"
+              >
+                <RefreshCw className={`w-4 h-4 ${refreshingPairing ? 'animate-spin' : ''}`} />
+                Buat Ulang Kode
+              </button>
               <span className="text-xs text-slate-400">
-                Diperbarui otomatis dari endpoint /api/pairing
+                Batas waktu pairing 5 menit
               </span>
             </div>
           </div>

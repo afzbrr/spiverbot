@@ -32,6 +32,26 @@ function setStatusBadge(el, status) {
   }
 }
 
+let currentExpiresAt = null;
+let currentStatus = 'Offline';
+
+function updateCountdownText() {
+  const countdownEl = document.getElementById('pairingCountdown');
+  if (!countdownEl) return;
+  if (currentStatus === 'Online') {
+    countdownEl.textContent = 'Perangkat sudah tertaut';
+    return;
+  }
+  if (!currentExpiresAt) {
+    countdownEl.textContent = 'Masa berlaku: 05:00';
+    return;
+  }
+  const diffSec = Math.max(0, Math.floor((currentExpiresAt - Date.now()) / 1000));
+  const mins = String(Math.floor(diffSec / 60)).padStart(2, '0');
+  const secs = String(diffSec % 60).padStart(2, '0');
+  countdownEl.textContent = diffSec > 0 ? `Berlaku ${mins}:${secs}` : 'Kode habis, membuat kode baru...';
+}
+
 async function fetchDashboardData() {
   const base = getApiBase();
   const statusEl = document.getElementById('botStatusText');
@@ -61,12 +81,15 @@ async function fetchDashboardData() {
 
     if (pairingRes.ok) {
       const p = await pairingRes.json();
+      currentStatus = p.status || 'Offline';
+      currentExpiresAt = p.expiresAt || (p.remainingSeconds ? Date.now() + p.remainingSeconds * 1000 : null);
       pairingPhoneEl.textContent = p.phoneNumber || '-';
       if (p.status === 'Online') {
         pairingCodeEl.textContent = 'SUDAH TERTAUT';
       } else {
         pairingCodeEl.textContent = p.code ? formatPairingCode(p.code) : 'MENUNGGU KODE';
       }
+      updateCountdownText();
     }
   } catch {
     setStatusBadge(statusEl, 'Offline');
@@ -78,6 +101,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const saveApiBtn = document.getElementById('saveApiBtn');
   const refreshBtn = document.getElementById('refreshBtn');
   const copyPairingBtn = document.getElementById('copyPairingBtn');
+  const refreshPairingBtn = document.getElementById('refreshPairingBtn');
   const copyGithubBtn = document.getElementById('copyGithubBtn');
   const feedbackEl = document.getElementById('copyFeedback');
 
@@ -94,6 +118,27 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   refreshBtn.addEventListener('click', fetchDashboardData);
+
+  if (refreshPairingBtn) {
+    refreshPairingBtn.addEventListener('click', async () => {
+      const base = getApiBase();
+      feedbackEl.textContent = 'Membuat kode baru...';
+      try {
+        const res = await fetch(`${base}/api/pairing/refresh`, { method: 'POST' });
+        if (res.ok) {
+          await fetchDashboardData();
+          feedbackEl.textContent = 'Kode baru berlaku 5 menit.';
+        } else {
+          feedbackEl.textContent = 'Gagal membuat ulang kode.';
+        }
+      } catch {
+        feedbackEl.textContent = 'Server belum terhubung.';
+      }
+      setTimeout(() => {
+        feedbackEl.textContent = '';
+      }, 3000);
+    });
+  }
 
   copyPairingBtn.addEventListener('click', async () => {
     const codeText = document.getElementById('pairingCodeDisplay').textContent.trim();
@@ -123,4 +168,5 @@ document.addEventListener('DOMContentLoaded', () => {
 
   fetchDashboardData();
   setInterval(fetchDashboardData, 5000);
+  setInterval(updateCountdownText, 1000);
 });
