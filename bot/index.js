@@ -55,6 +55,7 @@ import {
   getSetting,
   setSetting,
   getStats,
+  isSupabaseConfigured,
 } from './db.js';
 import { startGame, handleGameAnswerOrSurrender } from './games.js';
 import { download, getAudio, mapping as downloadMapping } from './downloader.js';
@@ -79,6 +80,8 @@ let runtimePhoneNumber = cleanNumber(process.env.PHONE_NUMBER);
 let activeSock = null;
 let pairingRefreshTimer = null;
 let reconnectTimer = null;
+let rateLimitWatchTimer = null;
+let sessionBackupTimer = null;
 let isRequestingPairing = false;
 let isStartingBot = false;
 let currentBotRunId = 0;
@@ -474,6 +477,71 @@ async function startExpressServer() {
   });
 }
 
+const SUPABASE_SESSION_KEY = 'wa_auth_session';
+const RATE_LIMIT_COOLDOWN_MS = 15 * 60 * 1000; // 15 menit
+
+async function backupSessionToSupabase(sessionDir) {
+  if (!isSupabaseConfigured) return false;
+  try {
+    const credsPath = path.join(sessionDir, 'creds.json');
+    if (!fs.existsSync(credsPath)) return false;
+    const credsRaw = await fs.promises.readFile(credsPath, 'utf-8');
+    const credsParsed = JSON.parse(credsRaw);
+    if (!credsParsed?.registered) return false;
+
+    const files = await fs.promises.readdir(sessionDir);
+    const payload = {};
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue;
+      const content = await fs.promises.readFile(path.join(sessionDir, file), 'utf-8');
+      payload[file] = content;
+    }
+    await setSetting(SUPABASE_SESSION_KEY, JSON.stringify(payload));
+    return true;
+  } catch (err) {
+    console.error('[Backup session error]', err?.message || err);
+    return false;
+  }
+}
+
+async function restoreSessionFromSupabase(sessionDir) {
+  if (!isSupabaseConfigured) return false;
+  try {
+    const raw = await getSetting(SUPABASE_SESSION_KEY, '');
+    if (!raw || !raw.startsWith('{')) return false;
+    const payload = JSON.parse(raw);
+    if (!payload['creds.json']) return false;
+    const credsParsed = JSON.parse(payload['creds.json']);
+    if (!credsParsed?.registered) return false;
+
+    await fs.promises.mkdir(sessionDir, { recursive: true });
+    for (const [filename, content] of Object.entries(payload)) {
+      if (!filename.endsWith('.json') || filename.includes('/') || filename.includes('..')) continue;
+      await fs.promises.writeFile(path.join(sessionDir, filename), String(content), 'utf-8');
+    }
+    console.log('☁️ Sesi WhatsApp dipulihkan dari Supabase!');
+    return true;
+  } catch (err) {
+    console.error('[Restore session error]', err?.message || err);
+    return false;
+  }
+}
+
+async function clearSupabaseSession() {
+  if (!isSupabaseConfigured) return;
+  try {
+    await setSetting(SUPABASE_SESSION_KEY, '');
+  } catch {}
+}
+
+function scheduleSessionBackup(sessionDir) {
+  if (!isSupabaseConfigured) return;
+  if (sessionBackupTimer) clearTimeout(sessionBackupTimer);
+  sessionBackupTimer = setTimeout(() => {
+    backupSessionToSupabase(sessionDir).catch(() => {});
+  }, 5000);
+}
+
 function clearPairingState() {
   global.pairingCode = null;
   global.pairingExpiresAt = null;
@@ -483,9 +551,17 @@ function clearPairingState() {
   }
 }
 
+function clearRateLimitWatchers() {
+  if (rateLimitWatchTimer) {
+    clearInterval(rateLimitWatchTimer);
+    rateLimitWatchTimer = null;
+  }
+}
+
 async function restartPairingSession() {
   currentBotRunId += 1;
   clearPairingState();
+  clearRateLimitWatchers();
   global.pairingError = null;
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
@@ -505,6 +581,7 @@ async function restartPairingSession() {
   await new Promise((r) => setTimeout(r, 300));
   const sessionDir = path.join(ROOT_DIR, 'session');
   await fs.promises.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+  await clearSupabaseSession();
   isStartingBot = false;
   isRequestingPairing = false;
   startBot().catch((err) => console.error('[Restart pairing error]', err));
@@ -572,7 +649,7 @@ async function requestFreshPairingCode(sock, phoneNumber, runId) {
       clearPairingState();
       if (iqResult.code === '429') {
         global.pairingError =
-          'WhatsApp membatasi permintaan pairing sementara (429 rate-overlimit). Tunggu 5-10 menit lalu tekan Buat Ulang Kode.';
+          'WhatsApp membatasi pairing sementara (429 rate-overlimit) pada nomor/IP server ini. Bot akan otomatis coba lagi 15 menit lagi, atau pair 1x dari HP/Laptop (Termux/PC) untuk auto-sync via Supabase.';
       } else if (iqResult.code === '400' || iqResult.code === '404' || iqResult.code === '406') {
         global.pairingError = `Nomor ${phoneNumber} ditolak server WhatsApp (Error ${iqResult.code}: ${iqResult.text}). Pastikan nomor aktif di WhatsApp format 628xxx.`;
       } else {
@@ -619,10 +696,16 @@ async function requestFreshPairingCode(sock, phoneNumber, runId) {
 async function startBot() {
   if (isStartingBot) return;
   isStartingBot = true;
+  clearRateLimitWatchers();
   const runId = ++currentBotRunId;
 
   try {
     const sessionDir = path.join(ROOT_DIR, 'session');
+    const localCredsPath = path.join(sessionDir, 'creds.json');
+    if (!fs.existsSync(localCredsPath)) {
+      await restoreSessionFromSupabase(sessionDir);
+    }
+
     let { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
     // Jika sesi belum registered DAN belum punya creds.account (belum pair-success),
@@ -658,7 +741,7 @@ async function startBot() {
       logger: pino({ level: 'error' }),
       printQRInTerminal: false,
       auth: state,
-      browser: Browsers.ubuntu('Chrome'),
+      browser: Browsers.macOS('Chrome'),
       countryCode: inferredCountry,
       qrTimeout: PAIRING_DURATION_MS,
       connectTimeoutMs: PAIRING_DURATION_MS,
@@ -683,9 +766,16 @@ async function startBot() {
 
     const safeSaveCreds = () => {
       if (runId !== currentBotRunId) return;
-      saveCredsChain = saveCredsChain.then(() => saveCreds()).catch((err) => {
-        console.error('[saveCreds error]', err?.message || err);
-      });
+      saveCredsChain = saveCredsChain
+        .then(async () => {
+          await saveCreds();
+          if (global.botStatus === 'Online' && sock.authState?.creds?.registered) {
+            scheduleSessionBackup(sessionDir);
+          }
+        })
+        .catch((err) => {
+          console.error('[saveCreds error]', err?.message || err);
+        });
     };
 
     sock.ev.on('creds.update', safeSaveCreds);
@@ -723,7 +813,7 @@ async function startBot() {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr && !sock.authState.creds.registered && !sock.authState.creds.account && !pairingRequestedForThisSocket) {
-        setTimeout(triggerPairingOnce, 600);
+        setTimeout(triggerPairingOnce, 3500);
       }
 
       if (connection === 'connecting') {
@@ -732,9 +822,14 @@ async function startBot() {
         global.botStatus = 'Online';
         global.pairingError = null;
         clearPairingState();
+        clearRateLimitWatchers();
         global.botName = sock.user?.name || 'SPIVER BOT';
         global.botNumber = cleanNumber((sock.user?.id || '').split(':')[0] || phoneNumber);
         console.log(`✅ SPIVER BOT Online sebagai ${global.botName} (${global.botNumber})`);
+        const synced = await backupSessionToSupabase(sessionDir);
+        if (synced) {
+          console.log('☁️ Sesi WhatsApp tersinkron ke Supabase (aman saat redeploy).');
+        }
       } else if (connection === 'close') {
         global.botStatus = 'Offline';
         const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -753,14 +848,45 @@ async function startBot() {
           clearPairingState();
           await saveCredsChain;
           await fs.promises.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+          await clearSupabaseSession();
         } else if (isPairedPendingRestart) {
           await saveCredsChain;
         }
 
-        // Jika masih belum paired dan error bukan restartRequired/loggedOut, beri jeda lebih aman agar tidak kena 429 rate-limit
         const isRateLimited = Boolean(global.pairingError && global.pairingError.includes('429'));
-        const shouldReconnect = !isRateLimited;
-        if (shouldReconnect) {
+        if (isRateLimited) {
+          console.log(
+            '⏸️ WhatsApp rate-limit (429) terdeteksi. Menjadwalkan coba ulang otomatis dalam 15 menit (JANGAN redeploy terus agar timer 429 tidak reset).'
+          );
+          console.log(
+            '💡 Tips cepat jika IP Railway dibatasi: jalankan "node bot/index.js" 1x dari Termux/Laptop dengan .env yang sama — sesi otomatis masuk ke Supabase & Railway langsung Online!'
+          );
+
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(() => {
+            if (runId === currentBotRunId) {
+              global.pairingError = null;
+              startBot().catch((err) => console.error('[Cooldown retry error]', err));
+            }
+          }, RATE_LIMIT_COOLDOWN_MS);
+
+          // Cek berkala setiap 15 detik apakah user sudah pairing dari Termux/Laptop dan tersimpan di Supabase
+          clearRateLimitWatchers();
+          rateLimitWatchTimer = setInterval(async () => {
+            if (runId !== currentBotRunId || global.botStatus === 'Online') {
+              clearRateLimitWatchers();
+              return;
+            }
+            const restored = await restoreSessionFromSupabase(sessionDir);
+            if (restored) {
+              clearRateLimitWatchers();
+              if (reconnectTimer) clearTimeout(reconnectTimer);
+              global.pairingError = null;
+              console.log('☁️ Sesi baru ditemukan di Supabase! Menghubungkan bot...');
+              startBot().catch((err) => console.error('[Supabase session boot error]', err));
+            }
+          }, 15_000);
+        } else {
           const delayMs = isRestartRequired ? 1200 : isLoggedOut ? 2500 : 5000;
           if (reconnectTimer) clearTimeout(reconnectTimer);
           reconnectTimer = setTimeout(() => {
@@ -768,8 +894,6 @@ async function startBot() {
               startBot().catch((err) => console.error('[Reconnect error]', err));
             }
           }, delayMs);
-        } else {
-          console.log('⏸️ Auto-reconnect dijeda sementara karena WhatsApp rate-limit (429). Tekan "Buat Ulang Kode" setelah beberapa menit.');
         }
       }
     });
