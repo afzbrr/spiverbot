@@ -81,6 +81,7 @@ async function fetchDashboardData() {
 
     if (pairingRes.ok) {
       const p = await pairingRes.json();
+      const errorBox = document.getElementById('pairingErrorBox');
       currentStatus = p.status || 'Offline';
       currentExpiresAt = p.expiresAt || (p.remainingSeconds ? Date.now() + p.remainingSeconds * 1000 : null);
       pairingPhoneEl.textContent = p.phoneNumber || '-';
@@ -88,6 +89,15 @@ async function fetchDashboardData() {
         pairingCodeEl.textContent = 'SUDAH TERTAUT';
       } else {
         pairingCodeEl.textContent = p.code ? formatPairingCode(p.code) : 'MENUNGGU KODE';
+      }
+      if (errorBox) {
+        if (p.error && p.status !== 'Online') {
+          errorBox.textContent = p.error;
+          errorBox.hidden = false;
+        } else {
+          errorBox.textContent = '';
+          errorBox.hidden = true;
+        }
       }
       updateCountdownText();
     }
@@ -102,6 +112,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const refreshBtn = document.getElementById('refreshBtn');
   const copyPairingBtn = document.getElementById('copyPairingBtn');
   const refreshPairingBtn = document.getElementById('refreshPairingBtn');
+  const pairingPhoneInput = document.getElementById('pairingPhoneInput');
   const copyGithubBtn = document.getElementById('copyGithubBtn');
   const feedbackEl = document.getElementById('copyFeedback');
 
@@ -122,21 +133,27 @@ document.addEventListener('DOMContentLoaded', () => {
   if (refreshPairingBtn) {
     refreshPairingBtn.addEventListener('click', async () => {
       const base = getApiBase();
+      const customPhone = pairingPhoneInput ? pairingPhoneInput.value.trim() : '';
       feedbackEl.textContent = 'Membuat kode baru...';
       try {
-        const res = await fetch(`${base}/api/pairing/refresh`, { method: 'POST' });
-        if (res.ok) {
-          await fetchDashboardData();
+        const res = await fetch(`${base}/api/pairing/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(customPhone ? { phoneNumber: customPhone } : {}),
+        });
+        const data = await res.json().catch(() => ({}));
+        await fetchDashboardData();
+        if (res.ok && data.code) {
           feedbackEl.textContent = 'Kode baru berlaku 5 menit.';
         } else {
-          feedbackEl.textContent = 'Gagal membuat ulang kode.';
+          feedbackEl.textContent = data.error || 'Gagal membuat ulang kode.';
         }
       } catch {
         feedbackEl.textContent = 'Server belum terhubung.';
       }
       setTimeout(() => {
         feedbackEl.textContent = '';
-      }, 3000);
+      }, 4000);
     });
   }
 

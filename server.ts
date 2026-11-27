@@ -44,6 +44,7 @@ async function startDevServer() {
     const rawPhone = (process.env.PHONE_NUMBER || '').replace(/[^0-9]/g, '');
     res.json({
       code: null,
+      error: null,
       phoneNumber: rawPhone || '',
       status: rawPhone ? 'Connecting' : 'Offline',
       expiresAt: null,
@@ -53,9 +54,10 @@ async function startDevServer() {
   });
 
   app.post('/api/pairing/refresh', (req, res) => {
-    const rawPhone = (process.env.PHONE_NUMBER || '').replace(/[^0-9]/g, '');
+    const rawPhone = (req.body?.phoneNumber || process.env.PHONE_NUMBER || '').replace(/[^0-9]/g, '');
     res.json({
       code: null,
+      error: null,
       phoneNumber: rawPhone || '',
       status: rawPhone ? 'Connecting' : 'Offline',
       expiresAt: Date.now() + 300000,

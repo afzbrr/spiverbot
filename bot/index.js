@@ -70,14 +70,18 @@ const PAIRING_DURATION_MS = 5 * 60 * 1000; // 5 menit
 
 global.pairingCode = global.pairingCode || null;
 global.pairingExpiresAt = global.pairingExpiresAt || null;
+global.pairingError = global.pairingError || null;
 global.botStatus = global.botStatus || 'Offline';
 global.botName = global.botName || 'SPIVER BOT';
-global.botNumber = global.botNumber || (process.env.PHONE_NUMBER || '').replace(/[^0-9]/g, '');
+global.botNumber = global.botNumber || cleanNumber(process.env.PHONE_NUMBER);
 
+let runtimePhoneNumber = cleanNumber(process.env.PHONE_NUMBER);
 let activeSock = null;
 let pairingRefreshTimer = null;
+let reconnectTimer = null;
 let isRequestingPairing = false;
 let isStartingBot = false;
+let currentBotRunId = 0;
 
 const groupChatCounter = new Map();
 const groupLastActive = new Map();
@@ -155,8 +159,14 @@ function cleanNumber(raw) {
   let digits = String(raw || '').replace(/[^0-9]/g, '');
   if (digits.startsWith('0')) {
     digits = '62' + digits.slice(1);
+  } else if (digits.startsWith('620')) {
+    digits = '62' + digits.slice(3);
   }
   return digits;
+}
+
+function getActivePhoneNumber() {
+  return runtimePhoneNumber || cleanNumber(process.env.PHONE_NUMBER);
 }
 
 function toJid(number) {
@@ -353,13 +363,20 @@ async function createEmojiMixBuffer(emojiInput) {
 
 async function startExpressServer() {
   const app = express();
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+  });
   app.use(express.json());
 
   app.get('/api/status', async (req, res) => {
     const stats = await getStats();
     res.json({
       botName: global.botName || 'SPIVER BOT',
-      botNumber: global.botNumber || cleanNumber(process.env.PHONE_NUMBER) || '-',
+      botNumber: global.botNumber || getActivePhoneNumber() || '-',
       status: global.botStatus || 'Offline',
       totalUser: stats.totalUser,
       totalGroup: stats.totalGroup,
@@ -377,7 +394,8 @@ async function startExpressServer() {
         : 0;
     res.json({
       code: global.pairingCode || null,
-      phoneNumber: cleanNumber(process.env.PHONE_NUMBER) || '',
+      error: global.pairingError || null,
+      phoneNumber: getActivePhoneNumber() || '',
       status: global.botStatus || 'Offline',
       expiresAt,
       remainingSeconds,
@@ -386,13 +404,27 @@ async function startExpressServer() {
   });
 
   app.post('/api/pairing/refresh', async (req, res) => {
-    const phoneNumber = cleanNumber(process.env.PHONE_NUMBER);
-    if (!phoneNumber) {
-      return res.status(400).json({ error: 'PHONE_NUMBER belum diisi di .env' });
+    const requestedPhone = req.body?.phoneNumber ? cleanNumber(req.body.phoneNumber) : '';
+    if (requestedPhone) {
+      if (requestedPhone.length < 10 || requestedPhone.length > 15) {
+        return res.status(400).json({
+          error: 'Format nomor HP tidak valid. Gunakan kode negara, contoh: 6281234567890',
+        });
+      }
+      runtimePhoneNumber = requestedPhone;
+      global.botNumber = requestedPhone;
     }
-    if (activeSock?.authState?.creds?.registered || activeSock?.authState?.creds?.account) {
+
+    const phoneNumber = getActivePhoneNumber();
+    if (!phoneNumber || phoneNumber.length < 10) {
+      global.pairingError = 'PHONE_NUMBER belum diisi atau tidak valid (contoh: 6281234567890).';
+      return res.status(400).json({ error: global.pairingError });
+    }
+
+    if (activeSock?.authState?.creds?.registered && activeSock?.authState?.creds?.account) {
       return res.json({
         code: null,
+        error: null,
         phoneNumber,
         status: global.botStatus || 'Online',
         expiresAt: null,
@@ -403,8 +435,8 @@ async function startExpressServer() {
 
     await restartPairingSession();
 
-    for (let i = 0; i < 25; i++) {
-      if (global.pairingCode) break;
+    for (let i = 0; i < 35; i++) {
+      if (global.pairingCode || global.pairingError) break;
       await new Promise((r) => setTimeout(r, 300));
     }
 
@@ -413,6 +445,7 @@ async function startExpressServer() {
       : 0;
     return res.json({
       code: global.pairingCode || null,
+      error: global.pairingError || null,
       phoneNumber,
       status: global.botStatus || 'Connecting',
       expiresAt: global.pairingExpiresAt,
@@ -441,48 +474,131 @@ async function startExpressServer() {
   });
 }
 
-async function restartPairingSession() {
+function clearPairingState() {
   global.pairingCode = null;
   global.pairingExpiresAt = null;
   if (pairingRefreshTimer) {
     clearTimeout(pairingRefreshTimer);
     pairingRefreshTimer = null;
   }
+}
 
-  try {
-    if (activeSock) {
-      activeSock.ev.removeAllListeners('connection.update');
-      activeSock.ws?.close();
-    }
-  } catch {}
+async function restartPairingSession() {
+  currentBotRunId += 1;
+  clearPairingState();
+  global.pairingError = null;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
 
+  const oldSock = activeSock;
+  activeSock = null;
+  if (oldSock) {
+    try {
+      oldSock.ev.removeAllListeners();
+      oldSock.ws?.removeAllListeners();
+      oldSock.ws?.close();
+    } catch {}
+  }
+
+  await new Promise((r) => setTimeout(r, 300));
   const sessionDir = path.join(ROOT_DIR, 'session');
   await fs.promises.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
   isStartingBot = false;
+  isRequestingPairing = false;
   startBot().catch((err) => console.error('[Restart pairing error]', err));
 }
 
-async function requestFreshPairingCode(sock, phoneNumber, force = false) {
+function extractIqError(frame) {
+  if (!frame || frame.tag !== 'iq' || frame.attrs?.type !== 'error') return null;
+  const children = Array.isArray(frame.content) ? frame.content : [];
+  const errNode = children.find((c) => c?.tag === 'error');
+  const code = errNode?.attrs?.code || frame.attrs?.code || 'unknown';
+  const text = errNode?.attrs?.text || 'Pairing ditolak server WhatsApp';
+  return { code: String(code), text: String(text) };
+}
+
+async function requestFreshPairingCode(sock, phoneNumber, runId) {
   if (!sock || sock.authState?.creds?.registered || !phoneNumber) return null;
+  if (runId !== currentBotRunId || activeSock !== sock) return null;
   if (isRequestingPairing) return global.pairingCode;
 
-  const now = Date.now();
-  if (!force && global.pairingCode && global.pairingExpiresAt && now < global.pairingExpiresAt) {
-    return global.pairingCode;
-  }
-
   isRequestingPairing = true;
+  global.pairingError = null;
+
+  let cleanupFrameListener = () => {};
   try {
+    const iqPromise = new Promise((resolve) => {
+      let settled = false;
+      const done = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        sock.ws?.off?.('frame', onFrame);
+        resolve(result);
+      };
+
+      const onFrame = (frame) => {
+        if (!frame || frame instanceof Uint8Array || frame.tag !== 'iq') return;
+        const type = frame.attrs?.type;
+        const children = Array.isArray(frame.content) ? frame.content : [];
+        const hasCompanionNode = children.some((c) => c?.tag === 'link_code_companion_reg');
+
+        if (type === 'result' && hasCompanionNode) {
+          done({ ok: true });
+        } else if (type === 'error') {
+          const errInfo = extractIqError(frame);
+          if (errInfo) done({ ok: false, ...errInfo });
+        }
+      };
+
+      const timeout = setTimeout(() => done({ ok: true, timedOutWait: true }), 8000);
+      sock.ws?.on?.('frame', onFrame);
+      cleanupFrameListener = () => {
+        clearTimeout(timeout);
+        sock.ws?.off?.('frame', onFrame);
+      };
+    });
+
     const code = await sock.requestPairingCode(phoneNumber);
+    const iqResult = await iqPromise;
+
+    if (runId !== currentBotRunId || activeSock !== sock) {
+      return null;
+    }
+
+    if (!iqResult.ok) {
+      clearPairingState();
+      if (iqResult.code === '429') {
+        global.pairingError =
+          'WhatsApp membatasi permintaan pairing sementara (429 rate-overlimit). Tunggu 5-10 menit lalu tekan Buat Ulang Kode.';
+      } else if (iqResult.code === '400' || iqResult.code === '404' || iqResult.code === '406') {
+        global.pairingError = `Nomor ${phoneNumber} ditolak server WhatsApp (Error ${iqResult.code}: ${iqResult.text}). Pastikan nomor aktif di WhatsApp format 628xxx.`;
+      } else {
+        global.pairingError = `Gagal meminta kode pairing ke server WhatsApp (Error ${iqResult.code}: ${iqResult.text}).`;
+      }
+      console.error(`❌ Server WhatsApp menolak pairing (${iqResult.code}: ${iqResult.text})`);
+      return null;
+    }
+
     global.pairingCode = code;
     global.pairingExpiresAt = Date.now() + PAIRING_DURATION_MS;
-    console.log(`KODE PAIRING KAMU: ${code} (berlaku 5 menit)`);
+    global.pairingError = null;
+    const formatted = code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
+    console.log(`✅ Server WhatsApp mengonfirmasi pairing untuk ${phoneNumber}`);
+    console.log(`KODE PAIRING KAMU: ${formatted} (berlaku 5 menit)`);
 
     if (pairingRefreshTimer) {
       clearTimeout(pairingRefreshTimer);
     }
     pairingRefreshTimer = setTimeout(() => {
-      if (activeSock && !activeSock.authState?.creds?.registered && !activeSock.authState?.creds?.account) {
+      if (
+        runId === currentBotRunId &&
+        activeSock === sock &&
+        !sock.authState?.creds?.registered &&
+        !sock.authState?.creds?.account
+      ) {
         console.log('⏱️ Kode pairing 5 menit habis, membuat sesi pairing baru...');
         restartPairingSession();
       }
@@ -490,9 +606,12 @@ async function requestFreshPairingCode(sock, phoneNumber, force = false) {
 
     return code;
   } catch (e) {
+    clearPairingState();
+    global.pairingError = `Gagal meminta kode pairing: ${e?.message || 'koneksi terputus'}`;
     console.log('Gagal minta pairing code', e);
-    return global.pairingCode || null;
+    return null;
   } finally {
+    cleanupFrameListener();
     isRequestingPairing = false;
   }
 }
@@ -500,6 +619,8 @@ async function requestFreshPairingCode(sock, phoneNumber, force = false) {
 async function startBot() {
   if (isStartingBot) return;
   isStartingBot = true;
+  const runId = ++currentBotRunId;
+
   try {
     const sessionDir = path.join(ROOT_DIR, 'session');
     let { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -513,6 +634,8 @@ async function startBot() {
       ({ state, saveCreds } = await useMultiFileAuthState(sessionDir));
     }
 
+    if (runId !== currentBotRunId) return;
+
     let version;
     try {
       const waVer = await fetchLatestWaWebVersion({});
@@ -524,14 +647,19 @@ async function startBot() {
       const fallbackVer = await fetchLatestBaileysVersion();
       version = fallbackVer.version;
     }
+    if (runId !== currentBotRunId) return;
     console.log('🌐 Menggunakan versi WhatsApp Web:', version.join('.'));
+
+    const phoneNumber = getActivePhoneNumber();
+    const inferredCountry = phoneNumber.startsWith('62') ? 'ID' : 'US';
 
     const sock = makeWASocket({
       version,
-      logger: pino({ level: 'silent' }),
+      logger: pino({ level: 'error' }),
       printQRInTerminal: false,
       auth: state,
       browser: Browsers.ubuntu('Chrome'),
+      countryCode: inferredCountry,
       qrTimeout: PAIRING_DURATION_MS,
       connectTimeoutMs: PAIRING_DURATION_MS,
       defaultQueryTimeoutMs: 120_000,
@@ -540,41 +668,70 @@ async function startBot() {
       syncFullHistory: false,
     });
 
+    if (runId !== currentBotRunId) {
+      try {
+        sock.ev.removeAllListeners();
+        sock.ws?.close();
+      } catch {}
+      return;
+    }
+
     activeSock = sock;
 
-    const phoneNumber = cleanNumber(process.env.PHONE_NUMBER);
     let pairingRequestedForThisSocket = false;
+    let saveCredsChain = Promise.resolve();
+
+    const safeSaveCreds = () => {
+      if (runId !== currentBotRunId) return;
+      saveCredsChain = saveCredsChain.then(() => saveCreds()).catch((err) => {
+        console.error('[saveCreds error]', err?.message || err);
+      });
+    };
+
+    sock.ev.on('creds.update', safeSaveCreds);
+
+    // Log diagnostic pairing handshake frames (companion_finish / pair-success / stream error)
+    sock.ws?.on?.('frame', (frame) => {
+      if (!frame || frame instanceof Uint8Array || runId !== currentBotRunId) return;
+      if (frame.tag === 'notification' && frame.attrs?.type === 'link_code_companion_reg') {
+        console.log('🔗 Notifikasi pairing diterima dari HP, menyelesaikan autentikasi...');
+      } else if (frame.tag === 'iq' && Array.isArray(frame.content) && frame.content.some((c) => c?.tag === 'pair-success')) {
+        console.log('🎉 Perangkat berhasil ditautkan! Menyimpan kredensial...');
+      } else if (frame.tag === 'stream:error') {
+        const errCode = frame.content?.[0]?.tag || frame.attrs?.code || '';
+        if (errCode && errCode !== '515') {
+          console.log('⚠️ Stream error dari WhatsApp:', errCode);
+        }
+      }
+    });
 
     const triggerPairingOnce = () => {
-      if (pairingRequestedForThisSocket || sock.authState.creds.registered) return;
-      if (!phoneNumber) {
-        console.log('⚠️ PHONE_NUMBER belum diisi di .env (format: 628xxx). Pairing code tidak bisa dibuat.');
+      if (runId !== currentBotRunId || activeSock !== sock) return;
+      if (pairingRequestedForThisSocket || sock.authState.creds.registered || sock.authState.creds.account) return;
+      if (!phoneNumber || phoneNumber.length < 10) {
+        global.pairingError = 'PHONE_NUMBER belum diisi atau tidak valid (contoh: 6281234567890).';
+        console.log('⚠️ PHONE_NUMBER belum diisi atau tidak valid di .env (format: 628xxx). Pairing code tidak bisa dibuat.');
         return;
       }
       pairingRequestedForThisSocket = true;
       console.log(`📲 Meminta kode pairing untuk nomor: ${phoneNumber}`);
-      requestFreshPairingCode(sock, phoneNumber, true);
+      requestFreshPairingCode(sock, phoneNumber, runId);
     };
 
-    sock.ev.on('creds.update', saveCreds);
-
     sock.ev.on('connection.update', async (update) => {
+      if (runId !== currentBotRunId || activeSock !== sock) return;
       const { connection, lastDisconnect, qr } = update;
 
-      if (qr && !sock.authState.creds.registered && !pairingRequestedForThisSocket) {
-        setTimeout(triggerPairingOnce, 500);
+      if (qr && !sock.authState.creds.registered && !sock.authState.creds.account && !pairingRequestedForThisSocket) {
+        setTimeout(triggerPairingOnce, 600);
       }
 
       if (connection === 'connecting') {
         global.botStatus = 'Connecting';
       } else if (connection === 'open') {
         global.botStatus = 'Online';
-        global.pairingCode = null;
-        global.pairingExpiresAt = null;
-        if (pairingRefreshTimer) {
-          clearTimeout(pairingRefreshTimer);
-          pairingRefreshTimer = null;
-        }
+        global.pairingError = null;
+        clearPairingState();
         global.botName = sock.user?.name || 'SPIVER BOT';
         global.botNumber = cleanNumber((sock.user?.id || '').split(':')[0] || phoneNumber);
         console.log(`✅ SPIVER BOT Online sebagai ${global.botName} (${global.botNumber})`);
@@ -583,16 +740,36 @@ async function startBot() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const isRestartRequired = statusCode === DisconnectReason.restartRequired;
         const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
-        const shouldReconnect = !isLoggedOut;
-        console.log('❌ Koneksi terputus. Reconnect:', shouldReconnect, 'Code:', statusCode);
+        const isPairedPendingRestart = Boolean(sock.authState.creds.registered || sock.authState.creds.account);
+
+        console.log('❌ Koneksi terputus. Code:', statusCode, 'Registered:', isPairedPendingRestart);
+
+        if (!isPairedPendingRestart) {
+          clearPairingState();
+        }
 
         if (isLoggedOut) {
-          global.pairingCode = null;
-          global.pairingExpiresAt = null;
+          global.pairingError = 'Sesi WhatsApp keluar (401). Membuat sesi pairing baru...';
+          clearPairingState();
+          await saveCredsChain;
           await fs.promises.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+        } else if (isPairedPendingRestart) {
+          await saveCredsChain;
         }
+
+        // Jika masih belum paired dan error bukan restartRequired/loggedOut, beri jeda lebih aman agar tidak kena 429 rate-limit
+        const isRateLimited = Boolean(global.pairingError && global.pairingError.includes('429'));
+        const shouldReconnect = !isRateLimited;
         if (shouldReconnect) {
-          setTimeout(() => startBot(), isRestartRequired ? 500 : 3000);
+          const delayMs = isRestartRequired ? 1200 : isLoggedOut ? 2500 : 5000;
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(() => {
+            if (runId === currentBotRunId) {
+              startBot().catch((err) => console.error('[Reconnect error]', err));
+            }
+          }, delayMs);
+        } else {
+          console.log('⏸️ Auto-reconnect dijeda sementara karena WhatsApp rate-limit (429). Tekan "Buat Ulang Kode" setelah beberapa menit.');
         }
       }
     });

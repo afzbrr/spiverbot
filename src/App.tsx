@@ -13,6 +13,7 @@ interface BotStatus {
 
 interface PairingInfo {
   code: string | null;
+  error?: string | null;
   phoneNumber: string;
   status: string;
   expiresAt?: number | null;
@@ -55,6 +56,7 @@ export default function App() {
   const [copiedPairing, setCopiedPairing] = useState<boolean>(false);
   const [copiedGithub, setCopiedGithub] = useState<boolean>(false);
   const [remainingSec, setRemainingSec] = useState<number>(300);
+  const [phoneInput, setPhoneInput] = useState<string>('');
 
   const loadData = async () => {
     setLoading(true);
@@ -112,12 +114,14 @@ export default function App() {
   const handleRefreshPairing = async () => {
     setRefreshingPairing(true);
     try {
-      const res = await fetch('/api/pairing/refresh', { method: 'POST' });
-      if (res.ok) {
-        const p: PairingInfo = await res.json();
-        setPairingData(p);
-        setRemainingSec(p.remainingSeconds ?? 300);
-      }
+      const res = await fetch('/api/pairing/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(phoneInput.trim() ? { phoneNumber: phoneInput.trim() } : {}),
+      });
+      const p: PairingInfo = await res.json();
+      setPairingData(p);
+      setRemainingSec(p.remainingSeconds ?? 300);
     } catch {
       // Abaikan jika gagal
     } finally {
@@ -267,6 +271,23 @@ export default function App() {
                 {displayedCode}
               </div>
               <p className="text-xs text-slate-400 font-mono-tabular">{countdownLabel}</p>
+            </div>
+
+            {pairingData.error && pairingData.status !== 'Online' && (
+              <div className="bg-rose-500/10 border border-rose-500/35 text-rose-300 rounded-lg px-4 py-2.5 text-xs leading-relaxed">
+                {pairingData.error}
+              </div>
+            )}
+
+            <div>
+              <input
+                type="tel"
+                inputMode="numeric"
+                value={phoneInput}
+                onChange={(e) => setPhoneInput(e.target.value)}
+                placeholder="Ganti nomor WA (contoh: 6281234567890)"
+                className="w-full bg-[#182235] border border-slate-700/70 rounded-lg px-3.5 py-2.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-emerald-500"
+              />
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
