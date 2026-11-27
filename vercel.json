@@ -1,0 +1,16 @@
+{
+  "rewrites": [
+    {
+      "source": "/pairing",
+      "destination": "/web/index.html"
+    },
+    {
+      "source": "/qr",
+      "destination": "/web/index.html"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/web/$1"
+    }
+  ]
+}

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="id" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SPIVER BOT — Dashboard & Pairing WhatsApp</title>
+  <meta name="description" content="Dashboard kontrol SPIVER BOT WhatsApp Grup dengan Pairing Code dan database Supabase." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <a href="/" class="brand">SPIVER BOT</a>
+      <nav class="nav-links" aria-label="Navigasi utama">
+        <a href="#overview">Overview</a>
+        <a href="#pairing">Pairing</a>
+        <a href="#menus">Daftar Menu</a>
+        <a href="#deploy">Deploy</a>
+      </nav>
+      <button id="refreshBtn" class="btn btn-primary" type="button">Perbarui Data</button>
+    </div>
+  </header>
+
+  <main class="container main-content">
+    <section id="overview" class="hero-section">
+      <div class="hero-header">
+        <div>
+          <p class="kicker">WhatsApp Grup Bot · Pairing Code · Supabase</p>
+          <h1>SPIVER BOT Control Center</h1>
+          <p class="subtitle">Pantau status bot, kode pairing 8 digit untuk satu perangkat, serta statistik pengguna dan coin secara langsung.</p>
+        </div>
+        <div class="status-block">
+          <span class="meta-label">Status Bot</span>
+          <strong id="botStatusText" class="status-value status-offline">Offline</strong>
+        </div>
+      </div>
+
+      <div class="stats-grid" aria-label="Statistik Bot">
+        <div class="stat-cell">
+          <span class="stat-label">Nama Bot</span>
+          <span id="botName" class="stat-value">SPIVER BOT</span>
+        </div>
+        <div class="stat-cell">
+          <span class="stat-label">Nomor Bot</span>
+          <span id="botNumber" class="stat-value mono">-</span>
+        </div>
+        <div class="stat-cell">
+          <span class="stat-label">Total User</span>
+          <span id="totalUser" class="stat-value mono">0</span>
+        </div>
+        <div class="stat-cell">
+          <span class="stat-label">Total Grup</span>
+          <span id="totalGroup" class="stat-value mono">0</span>
+        </div>
+        <div class="stat-cell">
+          <span class="stat-label">Total Coin</span>
+          <span id="totalCoin" class="stat-value mono accent-text">0</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="pairing" class="pairing-section">
+      <div class="pairing-grid">
+        <div class="pairing-code-panel">
+          <p class="section-label">Tautkan Perangkat WhatsApp</p>
+          <h2>Kode Pairing 8 Digit</h2>
+          <p class="pairing-meta">Nomor target: <span id="pairingPhone" class="mono">-</span></p>
+          <div class="pairing-box">
+            <span class="pairing-box-label">KODE PAIRING</span>
+            <div id="pairingCodeDisplay" class="pairing-code mono">MENUNGGU</div>
+          </div>
+          <div class="pairing-actions">
+            <button id="copyPairingBtn" class="btn btn-primary" type="button">Salin Kode Pairing</button>
+            <span id="copyFeedback" class="feedback-text" aria-live="polite"></span>
+          </div>
+        </div>
+
+        <div class="pairing-steps-panel">
+          <h3>Cara Tautkan Perangkat (1 HP)</h3>
+          <ol class="steps-list">
+            <li>Buka aplikasi <strong>WhatsApp</strong> di HP kamu.</li>
+            <li>Ketuk ikon <strong>Titik 3</strong> di pojok kanan atas (atau Pengaturan di iOS).</li>
+            <li>Pilih menu <strong>Perangkat Tertaut</strong> lalu tekan <strong>Tautkan Perangkat</strong>.</li>
+            <li>Pilih opsi <strong>Tautkan dengan Nomor Telepon</strong> di bagian bawah layar.</li>
+            <li>Masukkan kode 8 digit yang tampil di kotak sebelah kiri.</li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <section id="deploy" class="actions-section">
+      <div class="section-head">
+        <div>
+          <h2>Tautan & Infrastruktur</h2>
+          <p class="muted">Akses cepat ke repositori GitHub, layanan bot Railway, dan database Supabase.</p>
+        </div>
+      </div>
+
+      <div class="action-buttons-row">
+        <button id="copyGithubBtn" class="btn btn-secondary" type="button">Copy Link GitHub</button>
+        <a class="btn btn-secondary" href="https://railway.app/dashboard" target="_blank" rel="noopener noreferrer">Buka Railway</a>
+        <a class="btn btn-secondary" href="https://supabase.com/dashboard" target="_blank" rel="noopener noreferrer">Buka Supabase</a>
+      </div>
+
+      <div class="backend-config">
+        <label for="apiBaseInput" class="meta-label">URL Server Bot Railway (opsional jika dashboard di-host terpisah di Vercel)</label>
+        <div class="backend-input-row">
+          <input id="apiBaseInput" type="url" placeholder="https://spiver-bot.up.railway.app" />
+          <button id="saveApiBtn" class="btn btn-primary" type="button">Hubungkan</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="menus" class="menus-section">
+      <div class="section-head">
+        <div>
+          <h2>Daftar Perintah Utama</h2>
+          <p class="muted">Menang game = +50 coin · Pakai perintah = +1 coin · Menyerah = +1 coin</p>
+        </div>
+      </div>
+      <div class="menu-grid">
+        <article class="menu-card">
+          <h3>Download (.menu download)</h3>
+          <p class="mono small">.instagram · .tiktok · .spotify · .youtube · .facebook · .threads · .x · .capcut · .am · .pinterest · .toaudio</p>
+        </article>
+        <article class="menu-card">
+          <h3>Game (.menu game)</h3>
+          <p class="mono small">.tebakhewan · .tebakkota · .tebakbendera · .caklontong · .kuisrandom · .kuismatematika · .kuisislami · .truthordare · .nyerah</p>
+        </article>
+        <article class="menu-card">
+          <h3>Grup (.menu grup)</h3>
+          <p class="mono small">.afk · .kick · .ban · .mute · .absen · .cekabsen · .setwelcome · .enable antilink · .tagall · .hidetag · .revoke · .me</p>
+        </article>
+        <article class="menu-card">
+          <h3>Fun, Stiker & AI</h3>
+          <p class="mono small">.jadian · .cekkhodam · .menfess · .stiker · .brat · .qc · .emojimix · .aistiker · .toanime · .buatlagu · .ngobrolai · .aifoto</p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <span>SPIVER BOT</span>
+      <span>Node.js · Baileys Pairing · Supabase · Railway & Vercel</span>
+    </div>
+  </footer>
+
+  <script src="/script.js"></script>
+</body>
+</html>
