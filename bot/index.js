@@ -1,6 +1,7 @@
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
   DisconnectReason,
   downloadMediaMessage,
   jidNormalizedUser,
@@ -389,7 +390,7 @@ async function startExpressServer() {
     if (!phoneNumber) {
       return res.status(400).json({ error: 'PHONE_NUMBER belum diisi di .env' });
     }
-    if (!activeSock || activeSock.authState?.creds?.registered) {
+    if (activeSock?.authState?.creds?.registered || activeSock?.authState?.creds?.account) {
       return res.json({
         code: null,
         phoneNumber,
@@ -399,12 +400,19 @@ async function startExpressServer() {
         ttlMs: PAIRING_DURATION_MS,
       });
     }
-    const code = await requestFreshPairingCode(activeSock, phoneNumber, true);
+
+    await restartPairingSession();
+
+    for (let i = 0; i < 25; i++) {
+      if (global.pairingCode) break;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+
     const remainingSeconds = global.pairingExpiresAt
       ? Math.max(0, Math.floor((global.pairingExpiresAt - Date.now()) / 1000))
       : 0;
     return res.json({
-      code,
+      code: global.pairingCode || null,
       phoneNumber,
       status: global.botStatus || 'Connecting',
       expiresAt: global.pairingExpiresAt,
@@ -433,6 +441,27 @@ async function startExpressServer() {
   });
 }
 
+async function restartPairingSession() {
+  global.pairingCode = null;
+  global.pairingExpiresAt = null;
+  if (pairingRefreshTimer) {
+    clearTimeout(pairingRefreshTimer);
+    pairingRefreshTimer = null;
+  }
+
+  try {
+    if (activeSock) {
+      activeSock.ev.removeAllListeners('connection.update');
+      activeSock.ws?.close();
+    }
+  } catch {}
+
+  const sessionDir = path.join(ROOT_DIR, 'session');
+  await fs.promises.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+  isStartingBot = false;
+  startBot().catch((err) => console.error('[Restart pairing error]', err));
+}
+
 async function requestFreshPairingCode(sock, phoneNumber, force = false) {
   if (!sock || sock.authState?.creds?.registered || !phoneNumber) return null;
   if (isRequestingPairing) return global.pairingCode;
@@ -453,9 +482,9 @@ async function requestFreshPairingCode(sock, phoneNumber, force = false) {
       clearTimeout(pairingRefreshTimer);
     }
     pairingRefreshTimer = setTimeout(() => {
-      if (activeSock && !activeSock.authState?.creds?.registered) {
-        console.log('⏱️ Kode pairing 5 menit habis, membuat kode pairing baru...');
-        requestFreshPairingCode(activeSock, phoneNumber, true);
+      if (activeSock && !activeSock.authState?.creds?.registered && !activeSock.authState?.creds?.account) {
+        console.log('⏱️ Kode pairing 5 menit habis, membuat sesi pairing baru...');
+        restartPairingSession();
       }
     }, PAIRING_DURATION_MS);
 
@@ -475,15 +504,27 @@ async function startBot() {
     const sessionDir = path.join(ROOT_DIR, 'session');
     let { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
-    // Jika sesi belum registered tapi sudah terlanjur menyimpan creds.me dari percobaan pairing sebelumnya,
+    // Jika sesi belum registered DAN belum punya creds.account (belum pair-success),
+    // tapi sudah terlanjur menyimpan creds.me dari percobaan pairing sebelumnya,
     // bersihkan agar Baileys memakai generateRegistrationNode (bukan generateLoginNode)
-    if (!state.creds.registered && state.creds.me) {
+    if (!state.creds.registered && !state.creds.account && state.creds.me) {
       console.log('🧹 Membersihkan sisa sesi pairing lama yang belum selesai...');
       await fs.promises.rm(sessionDir, { recursive: true, force: true });
       ({ state, saveCreds } = await useMultiFileAuthState(sessionDir));
     }
 
-    const { version } = await fetchLatestBaileysVersion();
+    let version;
+    try {
+      const waVer = await fetchLatestWaWebVersion({});
+      if (waVer?.version) {
+        version = waVer.version;
+      }
+    } catch {}
+    if (!version) {
+      const fallbackVer = await fetchLatestBaileysVersion();
+      version = fallbackVer.version;
+    }
+    console.log('🌐 Menggunakan versi WhatsApp Web:', version.join('.'));
 
     const sock = makeWASocket({
       version,
@@ -495,6 +536,7 @@ async function startBot() {
       connectTimeoutMs: PAIRING_DURATION_MS,
       defaultQueryTimeoutMs: 120_000,
       keepAliveIntervalMs: 25_000,
+      markOnlineOnConnect: false,
       syncFullHistory: false,
     });
 
